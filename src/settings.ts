@@ -17,11 +17,7 @@ export class MemorySettingTab extends PluginSettingTab {
     line: (label: string, value: string) => void;
     note: (text: string) => void;
   } {
-    const box = el.createDiv();
-    box.style.padding = "10px 14px";
-    box.style.margin = "0 0 16px";
-    box.style.borderRadius = "8px";
-    box.style.background = "var(--background-secondary)";
+    const box = el.createDiv({ cls: "view-memory-info-box" });
     return {
       line: (label: string, value: string) => {
         const row = box.createDiv();
@@ -35,7 +31,6 @@ export class MemorySettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "记忆助手" });
     containerEl.createEl("p", {
       text: "替 Obsidian 记住两类它自己记不住 / 会记错的东西：左侧文件列表展开到哪几层，以及每个 PDF 读到第几页、每个画布停在哪。",
     });
@@ -48,7 +43,7 @@ export class MemorySettingTab extends PluginSettingTab {
   // ── 文件列表 ──────────────────────────────────────────────
 
   private renderFold(el: HTMLElement): void {
-    el.createEl("h3", { text: "文件列表展开状态" });
+    new Setting(el).setName("文件列表展开状态").setHeading();
     const s = this.plugin.settings.fold;
 
     new Setting(el)
@@ -149,7 +144,7 @@ export class MemorySettingTab extends PluginSettingTab {
   // ── 阅读位置与视窗 ────────────────────────────────────────
 
   private renderView(el: HTMLElement): void {
-    el.createEl("h3", { text: "阅读位置与视窗" });
+    new Setting(el).setName("阅读位置与视窗").setHeading();
     const s = this.plugin.settings.view;
 
     new Setting(el)
@@ -208,7 +203,7 @@ export class MemorySettingTab extends PluginSettingTab {
     new Setting(el)
       .setName("接管 Excalidraw 绘图")
       .setDesc(
-        "Excalidraw 的 md 内嵌绘图不存视窗（数据里没有 scrollX/zoom），而且它的「打开时缩放以适应」默认开着，所以每次打开都会缩到全图。这里记住你上次停的地方并套回去。",
+        "Excalidraw 的 md 内嵌绘图不存视窗（数据里没有滚动位置与缩放），而且它的「打开时缩放以适应」默认开着，所以每次打开都会缩到全图。这里记住你上次停的地方并套回去。",
       )
       .addToggle((t) =>
         t.setValue(s.kinds.excalidraw).onChange(async (v) => {
@@ -218,9 +213,9 @@ export class MemorySettingTab extends PluginSettingTab {
       );
 
     new Setting(el)
-      .setName("接管核心 Canvas")
+      .setName("接管核心画布")
       .setDesc(
-        "默认关闭：核心 Canvas 本来就把视窗（x/y/zoom）写进 workspace.json，用不着我们管。如果发现它也丢，再打开。",
+        "默认关闭：核心画布本来就把视窗（偏移与缩放）写进 workspace.json，用不着我们管。如果发现它也丢，再打开。",
       )
       .addToggle((t) =>
         t.setValue(s.kinds.canvas).onChange(async (v) => {
@@ -263,7 +258,7 @@ export class MemorySettingTab extends PluginSettingTab {
   // ── 通用 ──────────────────────────────────────────────────
 
   private renderCommon(el: HTMLElement): void {
-    el.createEl("h3", { text: "通用" });
+    new Setting(el).setName("通用").setHeading();
     new Setting(el)
       .setName("调试日志")
       .setDesc("在开发者控制台输出对平、恢复与折叠对账的过程（Ctrl+Shift+I 打开）。")

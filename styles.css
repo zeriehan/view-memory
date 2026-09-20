@@ -1,0 +1,7 @@
+/* 设置页里那块「当前状态」信息板 */
+.view-memory-info-box {
+	padding: 10px 14px;
+	margin: 0 0 16px;
+	border-radius: 8px;
+	background: var(--background-secondary);
+}

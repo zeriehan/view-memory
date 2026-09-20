@@ -191,7 +191,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
     // 文件改名/删除时把记录跟着搬 —— 记录是按路径存的，不搬就丢了
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        const to = (file as TFile).path;
+        if (!(file instanceof TFile)) return;
+        const to = file.path;
         if (renameRecord(this.settings.view.records, oldPath, to)) {
           this.log(`记录随改名迁移：${oldPath} → ${to}`);
           this.flushView();
@@ -200,8 +201,9 @@ export default class ObsidianMemoryPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        if (this.settings.view.records[(file as TFile).path]) {
-          delete this.settings.view.records[(file as TFile).path];
+        if (!(file instanceof TFile)) return;
+        if (this.settings.view.records[file.path]) {
+          delete this.settings.view.records[file.path];
           this.flushView();
         }
       }),
@@ -245,7 +247,11 @@ export default class ObsidianMemoryPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => void this.bootstrap());
   }
 
-  async onunload(): Promise<void> {
+  onunload(): void {
+    void this.unloadCleanup();
+  }
+
+  private async unloadCleanup(): Promise<void> {
     for (const id of this.deferIds) window.clearTimeout(id);
     this.deferIds = [];
     if (this.reconcileId !== null) {
@@ -395,7 +401,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
    *     ├ .store      = ViewHistory（就是它把阅读位置写进 localStorage）
    *     └ .pdfDocument
    */
-  private pdfApp(leaf: WorkspaceLeaf): any | null {
+  private pdfApp(leaf: WorkspaceLeaf): any {
     const v: any = leaf.view;
     const wrapper = v && v.viewer;
     const core = wrapper && wrapper.child;
@@ -711,8 +717,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
     }, 3000);
   }
 
-  private log(...args: any[]): void {
-    if (this.settings && this.settings.debug) console.log("[obsidian-memory]", ...args);
+  private log(...args: unknown[]): void {
+    if (this.settings && this.settings.debug) console.debug("[view-memory]", ...args);
   }
 
   // ══════════ 配置 ══════════════════════════════════════════
@@ -773,8 +779,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
       const base = (this.app.vault.adapter as any)?.basePath;
       if (typeof base !== "string" || !base) return done;
 
-      const readJson = (id: string): any | null => {
-        const p = path.join(base, ".obsidian", "plugins", id, "data.json");
+      const readJson = (id: string): any => {
+        const p = path.join(base, this.app.vault.configDir, "plugins", id, "data.json");
         if (!fs.existsSync(p)) return null;
         try {
           return JSON.parse(fs.readFileSync(p, "utf8"));

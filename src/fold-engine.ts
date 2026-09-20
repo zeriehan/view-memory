@@ -27,7 +27,7 @@ export interface EngineHost {
   loadSnapshot(): FoldState | null;
   /** 写本插件存的快照 */
   saveSnapshot(s: FoldState): void;
-  log(...args: any[]): void;
+  log(...args: unknown[]): void;
 }
 
 export interface EngineSettings {
@@ -65,7 +65,7 @@ export class FoldEngine {
     return Date.now();
   }
 
-  private log(...args: any[]): void {
+  private log(...args: unknown[]): void {
     this.host.log(...args);
   }
 

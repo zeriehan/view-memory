@@ -34,7 +34,7 @@ export interface EngineHost {
   reconcilePdf(): void;
   /** 有改动时调，宿主自己防抖落盘 */
   flush(): void;
-  log(...args: any[]): void;
+  log(...args: unknown[]): void;
 }
 
 export interface EngineSettings {
