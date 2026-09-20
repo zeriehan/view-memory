@@ -1,0 +1,17 @@
+{
+  "name": "view-memory",
+  "version": "1.0.0",
+  "description": "Obsidian 插件：记住文件列表展开状态、PDF 阅读位置与画布视窗",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "devDependencies": {
+    "builtin-modules": "^4.0.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "esbuild": "^0.23.0",
+    "obsidian": "^1.7.0"
+  }
+}
