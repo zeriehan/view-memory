@@ -4,7 +4,7 @@
  * 刻意不 import obsidian —— 这一层可以打成 CJS 在 Node 里直接跑回归测试。
  */
 
-export type ViewKind = "pdf" | "canvas" | "excalidraw";
+export type ViewKind = "pdf" | "md" | "canvas" | "excalidraw";
 
 /**
  * pdf.js 存在 `localStorage["pdfjs.history"]` 里的一条记录。
@@ -30,6 +30,11 @@ export interface ViewRecord {
   at: number;
   /** pdf：pdf.js 那条记录的原样副本（含 fingerprint） */
   pdf?: PdfEntry;
+  /**
+   * md：Obsidian 的 `MarkdownSubView.getScroll()` 口径 —— **小数行号**，不是像素。
+   * 源码模式与预览模式同量纲（Obsidian 自己切换模式时就是拿它互喂），所以不必区分模式。
+   */
+  scroll?: number;
   /** canvas / excalidraw：视窗位置（场景坐标）与缩放 */
   x?: number;
   y?: number;
@@ -237,18 +242,42 @@ export function closeViewport(
   return almost(az, bz, Math.max(0.005, bz * zoomRel));
 }
 
+// ── Markdown 滚动位置 ───────────────────────────────────────
+
+/**
+ * 两个滚动位置算不算"同一处"。
+ *
+ * 口径是**小数行号**（`MarkdownSubView.getScroll()`），不是像素，所以容差按"行"给：
+ * 默认 0.75 行 —— 同一屏内的小抖动不该被当成"换地方了"。
+ */
+export function closeScroll(
+  a: number | null | undefined,
+  b: number | null | undefined,
+  tol = 0.75,
+): boolean {
+  const av = num(a);
+  const bv = num(b);
+  if (av === null || bv === null || av < 0 || bv < 0) return false;
+  return Math.abs(av - bv) <= tol;
+}
+
 // ── 记录整体 ────────────────────────────────────────────────
 
 export function normalizeRecord(raw: unknown): ViewRecord | null {
   if (!raw || typeof raw !== "object") return null;
   const src = raw as Record<string, unknown>;
   const kind = src.kind;
-  if (kind !== "pdf" && kind !== "canvas" && kind !== "excalidraw") return null;
+  if (kind !== "pdf" && kind !== "md" && kind !== "canvas" && kind !== "excalidraw") return null;
   const at = num(src.at) ?? 0;
   if (kind === "pdf") {
     const pdf = normalizePdfEntry(src.pdf);
     if (!pdf) return null;
     return { kind, at, pdf };
+  }
+  if (kind === "md") {
+    const scroll = num(src.scroll);
+    if (scroll === null || scroll < 0) return null;
+    return { kind, at, scroll };
   }
   const x = num(src.x);
   const y = num(src.y);
@@ -284,6 +313,8 @@ export function sameRecord(
     if (a.pdf.fingerprint !== b.pdf.fingerprint) return false;
     return samePdfValues(a.pdf, b.pdf);
   }
+  // md 用更紧的容差判"变没变"（0.5 行），免得同一处的小抖动每拍都写盘
+  if (a.kind === "md") return closeScroll(a.scroll, b.scroll, 0.5);
   return closeViewport(a, b, 0.5, 0.002);
 }
 
@@ -316,6 +347,10 @@ export function describeRecord(rec: ViewRecord): string {
   if (rec.kind === "pdf") {
     const p = num(rec.pdf?.page);
     return p !== null ? `第 ${p} 页` : "未读到页码";
+  }
+  if (rec.kind === "md") {
+    const s = num(rec.scroll);
+    return s !== null ? `第 ${Math.floor(s) + 1} 行` : "未读到位置";
   }
   const z = num(rec.zoom) ?? 1;
   return `缩放 ${Math.round(z * 100)}%`;

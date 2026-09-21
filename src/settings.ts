@@ -38,6 +38,8 @@ export class MemorySettingTab extends PluginSettingTab {
         return s.view.restore;
       case "view.kinds.pdf":
         return s.view.kinds.pdf;
+      case "view.kinds.md":
+        return s.view.kinds.md;
       case "view.kinds.canvas":
         return s.view.kinds.canvas;
       case "view.kinds.excalidraw":
@@ -73,6 +75,9 @@ export class MemorySettingTab extends PluginSettingTab {
         break;
       case "view.kinds.pdf":
         s.view.kinds.pdf = on;
+        break;
+      case "view.kinds.md":
+        s.view.kinds.md = on;
         break;
       case "view.kinds.canvas":
         s.view.kinds.canvas = on;
@@ -169,6 +174,11 @@ export class MemorySettingTab extends PluginSettingTab {
         name: "接管 PDF",
         desc: "PDF 页码与滚动位置的记录与恢复。",
         control: { type: "toggle", key: "view.kinds.pdf" },
+      },
+      {
+        name: "接管 Markdown 滚动位置",
+        desc: "记住每个笔记滚到哪，下次打开摆回原处。记的是「小数行号」（Obsidian 自己的口径），所以源码模式和阅读模式通用 —— 在阅读模式读到的位置，切到源码模式也落在同一处。",
+        control: { type: "toggle", key: "view.kinds.md" },
       },
       {
         name: "接管 Excalidraw 绘图",

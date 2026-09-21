@@ -196,8 +196,13 @@ export default class ObsidianMemoryPlugin extends Plugin {
     // 打开文件时抢在 pdf.js 读存储之前把我们的记录写回去 —— 这样它自己就能恢复对
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
-        if (!this.settings.view.enabled || !this.settings.view.kinds.pdf) return;
-        if (file instanceof TFile) this.preparePdfFor(file.path);
+        if (!this.settings.view.enabled) return;
+        if (file instanceof TFile && this.settings.view.kinds.pdf) this.preparePdfFor(file.path);
+        // Markdown 没有"自己的存储"可以先写，只能等它渲染完再把滚动位置摆回去，
+        // 所以这里补几拍（引擎那边只会在恢复窗口内、且用户没接手时动手）
+        if (file instanceof TFile && this.settings.view.kinds.md) {
+          this.scheduleViewTick([250, 600, 1300, 2600]);
+        }
       }),
     );
 
@@ -463,6 +468,23 @@ export default class ObsidianMemoryPlugin extends Plugin {
     return { kind: "canvas", at: Date.now(), x, y, zoom };
   }
 
+  /**
+   * Markdown 的滚动位置。取的是 `currentMode.getScroll()` —— 无论是源码模式还是
+   * 预览模式，它都返回**小数行号**（不是像素），两种模式同量纲。
+   */
+  private mdLive(v: LeafViewLike): ViewRecord | null {
+    const mode = v.currentMode;
+    if (!mode || typeof mode.getScroll !== "function") return null;
+    let raw: number | null = null;
+    try {
+      raw = num(mode.getScroll());
+    } catch {
+      return null;
+    }
+    if (raw === null || raw < 0) return null;
+    return { kind: "md", at: Date.now(), scroll: raw };
+  }
+
   private handles(): ViewHandle[] {
     const out: ViewHandle[] = [];
     const push = (leaf: WorkspaceLeaf, kind: ViewKind, ready: boolean, live: ViewRecord | null) => {
@@ -493,6 +515,12 @@ export default class ObsidianMemoryPlugin extends Plugin {
       push(leaf, "canvas", ready, ready ? this.canvasLive(c) : null);
     }
 
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const v = leaf.view as unknown as LeafViewLike;
+      const live = v ? this.mdLive(v) : null;
+      push(leaf, "md", !!live, live);
+    }
+
     return out;
   }
 
@@ -510,8 +538,23 @@ export default class ObsidianMemoryPlugin extends Plugin {
     const leaf = this.leafOf(h);
     if (!leaf) return;
     if (h.kind === "pdf") this.applyPdf(leaf, rec);
+    else if (h.kind === "md") this.applyMarkdown(leaf, rec);
     else if (h.kind === "excalidraw") this.applyExcalidraw(leaf, rec);
     else this.applyCanvas(leaf, rec);
+  }
+
+  /** Markdown：把滚动位置摆回去。值就是当前模式的 `applyScroll()` 口径（小数行号） */
+  private applyMarkdown(leaf: WorkspaceLeaf, rec: ViewRecord): void {
+    const want = num(rec.scroll);
+    if (want === null || want < 0) return;
+    const v = leaf.view as unknown as LeafViewLike;
+    const mode = v && v.currentMode;
+    if (!mode || typeof mode.applyScroll !== "function") return;
+    try {
+      mode.applyScroll(want);
+    } catch (e) {
+      this.log("套用 Markdown 滚动位置失败", e);
+    }
   }
 
   private applyPdf(leaf: WorkspaceLeaf, rec: ViewRecord): void {
@@ -767,6 +810,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
       const d = defaultEngineSettings().kinds;
       merged.view.kinds = {
         pdf: merged.view.kinds.pdf !== false ? true : d.pdf,
+        md: merged.view.kinds.md !== false ? true : d.md,
         canvas: merged.view.kinds.canvas === true,
         excalidraw: merged.view.kinds.excalidraw !== false ? true : d.excalidraw,
       };

@@ -95,6 +95,19 @@ export interface LeafViewLike {
   excalidrawAPI?: ExcalidrawApiLike;
   excalidrawData?: unknown;
   preventAutozoom?(): void;
+  currentMode?: MarkdownSubViewLike;
+}
+
+/**
+ * Markdown 的子视图（源码模式 / 预览模式都实现它）。
+ *
+ * 滚动位置用的**不是像素**：`getScroll()` 返回小数行号（本机 1.13.7 实现里是
+ * `行号 + 行内偏移 / 行高`），`applyScroll()` 吃同一个口径。Obsidian 自己切模式时
+ * 就是拿一边的 getScroll 直接喂给另一边，所以这个值天然跨模式可用，不必存模式。
+ */
+export interface MarkdownSubViewLike {
+  getScroll?(): number;
+  applyScroll?(scroll: number): void;
 }
 
 /** App 上的本地存储读取（Obsidian 没把它列进类型） */

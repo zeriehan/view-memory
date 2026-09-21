@@ -8,6 +8,7 @@ import {
   Records,
   ViewKind,
   ViewRecord,
+  closeScroll,
   closeViewport,
   isPdfEntryUsable,
   sameRecord,
@@ -53,6 +54,13 @@ export interface EngineSettings {
    * 打开 PDF 的瞬间你可能已经在滚了，那会儿把你拽回旧页码是最讨嫌的行为。
    */
   userActiveMs: number;
+  /**
+   * 一个视图的"恢复阶段"有多长（从它第一次就绪算起）。
+   *
+   * 过了这段就只记录、不再套用 —— 否则"把视图摆回记录位置"这件事会变成
+   * 长期悬在头上的纠正，用户自己翻页后过一会儿又被拽回去（PDF 来回闪就是这个）。
+   */
+  restoreWindowMs: number;
 }
 
 export function defaultEngineSettings(): EngineSettings {
@@ -60,11 +68,12 @@ export function defaultEngineSettings(): EngineSettings {
     restore: true,
     // 核心 Canvas 本来就把视窗写进 workspace.json（它的 getState 里有 viewState），
     // 默认不去碰它；真发现它也丢，把开关打开即可。
-    kinds: { pdf: true, canvas: false, excalidraw: true },
+    kinds: { pdf: true, md: true, canvas: false, excalidraw: true },
     settleMs: 900,
     maxAttempts: 3,
     captureGraceMs: 2500,
     userActiveMs: 800,
+    restoreWindowMs: 6000,
   };
 }
 
@@ -72,6 +81,10 @@ interface ViewRuntime {
   firstReadyAt: number;
   attempts: number;
   appliedAt: number;
+  /** 套用那一刻的实况。下一拍拿它比：实况自己变了 = 不是我们干的 = 用户在动 */
+  liveAtApply: ViewRecord | null;
+  /** 已交还给用户：此后只记录，绝不套用（本视图生命周期内不再复位） */
+  handsOff: boolean;
 }
 
 export interface TickStats {
@@ -120,11 +133,13 @@ export class ViewMemoryEngine {
       if (!got) return false;
       return got.page === want.page;
     }
+    if (h.kind === "md") return closeScroll(h.live.scroll, rec.scroll);
     return closeViewport(h.live, rec);
   }
 
   private captureView(h: ViewHandle, live: ViewRecord): boolean {
     if (h.kind === "pdf" && !(live.pdf && isPdfEntryUsable(live.pdf))) return false;
+    if (h.kind === "md" && (live.scroll === undefined || live.scroll < 0)) return false;
     const old = this.host.records()[h.path];
     if (sameRecord(old, live)) return false;
     this.host.putRecord(h.path, { ...live, at: this.now() });
@@ -137,6 +152,10 @@ export class ViewMemoryEngine {
    *
    * 顺序很重要：先判"要不要恢复"，再判"要不要记录"。
    * 反过来的话，启动瞬间视图还是默认视窗，就会把默认值当成用户的新位置记下来。
+   *
+   * ★ 另一条铁律：**一个视图只允许被"摆"一次**。套用成功（或用户碰过它）之后立刻
+   * hands-off，之后实况就是唯一真相。否则"把视图摆回记录位置"会变成长期纠正 ——
+   * 用户翻到下一页，过一会儿又被拽回上一页，来回闪（PDF 就是这样）。
    */
   tick(): TickStats {
     const now = this.now();
@@ -151,25 +170,44 @@ export class ViewMemoryEngine {
       alive.add(h.key);
       let rt = this.states.get(h.key);
       if (!rt) {
-        rt = { firstReadyAt: 0, attempts: 0, appliedAt: 0 };
+        rt = { firstReadyAt: 0, attempts: 0, appliedAt: 0, liveAtApply: null, handsOff: false };
         this.states.set(h.key, rt);
       }
       if (!this.managed(h.kind)) continue;
       if (!h.ready || !h.live) continue;
       if (!rt.firstReadyAt) rt.firstReadyAt = now;
       const settled = now - rt.firstReadyAt >= this.settings.settleMs;
+      const inRestoreWindow = now - rt.firstReadyAt <= this.settings.restoreWindowMs;
 
-      // 刚动过手：整段静默。这段时间既不回读（别把宿主的异步覆盖记成用户的新位置），
+      // 套用之后实况自己变了 —— 不是我们干的，那就是用户（或宿主在异步落位）。
+      // 再动手就是抢，从此交还给他。
+      if (!rt.handsOff && rt.liveAtApply && !sameRecord(rt.liveAtApply, h.live)) {
+        rt.handsOff = true;
+        this.host.log("视图已被接手，不再套用：", h.path);
+      }
+
+      // 刚套用过之后的静默期：既不回读（别把宿主的异步覆盖记成用户的新位置），
       // 也不重复套用（别跟马上要尘埃落定的宿主抢）
       if (rt.appliedAt && now - rt.appliedAt < this.settings.captureGraceMs) continue;
 
       const rec = records[h.path];
-      if (rec && rec.kind === h.kind && this.settings.restore) {
-        const ok = this.isSatisfied(h, rec);
-        const handsOff = this.userActive(now);
-        if (!ok && !handsOff && settled && rt.attempts < this.settings.maxAttempts) {
+      const wantsRestore =
+        !!rec && rec.kind === h.kind && this.settings.restore && !rt.handsOff && inRestoreWindow;
+
+      if (rec && wantsRestore) {
+        if (this.isSatisfied(h, rec)) {
+          rt.handsOff = true; // 已经到位，收工
+        } else if (!settled) {
+          continue; // 还没到动手的时候，先什么都别记
+        } else if (this.userActive(now)) {
+          // 该摆回来了，但你正在翻 —— 说明你已经接手，这个视图让给你（此后只记录）。
+          // 注意这里**不 continue**：这一拍照常按实况记录，用户当前的位置才是最新。
+          rt.handsOff = true;
+          this.host.log("用户正在操作，交还视图：", h.path);
+        } else if (rt.attempts < this.settings.maxAttempts) {
           rt.attempts++;
           rt.appliedAt = now;
+          rt.liveAtApply = h.live;
           let done = false;
           try {
             this.host.applyRecord(h, rec);
@@ -179,9 +217,9 @@ export class ViewMemoryEngine {
           }
           if (done) restored++;
           continue; // 同一拍里别把刚改的自己读回来
+        } else {
+          rt.handsOff = true; // 试够了，认了
         }
-        // 还没到动手的时候，先什么都别记
-        if (!settled) continue;
       } else if (!settled) {
         continue;
       }
@@ -233,7 +271,7 @@ export class ViewMemoryEngine {
     return n;
   }
 
-  /** 命令用：把记录重新套一遍 */
+  /** 命令用：把记录重新套一遍（这一条是用户显式要的，多摆几次也认） */
   restoreNow(): number {
     let n = 0;
     const records = this.host.records();
@@ -242,6 +280,14 @@ export class ViewMemoryEngine {
       const rec = records[h.path];
       if (!rec || rec.kind !== h.kind) continue;
       if (this.isSatisfied(h, rec)) continue;
+      const rt = this.states.get(h.key);
+      if (rt) {
+        // 手动恢复是明确意图：重新武装，并让"实况自己变了"那条规则从这一刻重新计时
+        rt.handsOff = false;
+        rt.attempts = 0;
+        rt.appliedAt = this.now();
+        rt.liveAtApply = h.live;
+      }
       try {
         this.host.applyRecord(h, rec);
         n++;
