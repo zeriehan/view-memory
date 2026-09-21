@@ -1,8 +1,8 @@
 {
   "id": "view-memory",
   "name": "View Memory",
-  "version": "1.0.1",
-  "minAppVersion": "1.11.4",
+  "version": "1.1.0",
+  "minAppVersion": "1.13.0",
   "description": "记住文件列表展开到哪、每个 PDF 读到第几页、每个画布停在哪。重启后回到原处。",
   "author": "zeriehan",
   "isDesktopOnly": true

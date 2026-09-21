@@ -5,3 +5,10 @@
 	border-radius: 8px;
 	background: var(--background-secondary);
 }
+
+/* 一行「标签：值」，让标签那一列对齐 */
+.view-memory-info-row {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 2px 8px;
+}

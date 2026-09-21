@@ -1,6 +1,6 @@
 {
   "name": "view-memory",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Obsidian 插件：记住文件列表展开状态、PDF 阅读位置与画布视窗",
   "main": "main.js",
   "scripts": {
