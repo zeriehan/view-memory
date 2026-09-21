@@ -54,9 +54,14 @@
 
 ### Markdown：滚到哪
 - 位置用 **`MarkdownView.currentMode.getScroll()`** 取，返回的**不是像素，而是小数行号**
-  —— 本机 1.13.7 的实现是 `行号 + 行内偏移 / 行高`。回填用同口径的 `applyScroll()`。
+  —— 本机 1.13.7 的实现是 `行号 + 行内偏移 / 行高`。
+- **回填必须走 `leaf.view.setEphemeralState({ scroll })`，不要直接调 `currentMode.applyScroll()`**：
+  预览模式的 `renderer.applyScroll()` 在「文本还没渲染完 / 段落还没测量」时会**安静地
+  `return false`**，而刚打开文件恰好就是这个状态 → 直接调它经常等于没调（表现是"完全不动、也不报错"）。
+  走 `setEphemeralState` 时内部会转成 `applyScrollDelayed`：先试一次，不成就在 `onRendered`
+  之后再来一次。源码模式同样认 `scroll` 这个字段，还会把值记进 leaf 状态。
 - 这个口径**源码模式与预览模式通用**：Obsidian 自己切换模式时，就是拿一边的 `getScroll()`
-  直接喂给另一边的 `applyScroll()`（见 asar 里的 `showEditor`），所以不必额外记"存的时候是哪个模式"。
+  喂给另一边的 `applyScroll()`，所以不必额外记"存的时候是哪个模式"。
 - 存取时机：`file-open` 之后补几拍（250 / 600 / 1300 / 2600 ms）—— Markdown 没有"自己的存储"
   可以先写进去，只能等它渲染完再把位置摆回去。
 
@@ -122,7 +127,7 @@ src/settings.ts    设置页
 
 - 折叠侧回归：98 项
 - 视窗侧回归：165 项
-- 合并本身（命令 id 不撞车、配置分离、一个定时器驱动两边、记录迁移、设置页分节、启动引导、**Markdown 记录真能套回视图**）：37 项
+- 合并本身（命令 id 不撞车、配置分离、一个定时器驱动两边、记录迁移、设置页分节、启动引导、**Markdown 记录真能套回视图**）：41 项
 
 ## 依赖的非公开成员（升级 Obsidian 后需重跑回归）
 
