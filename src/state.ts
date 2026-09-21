@@ -72,20 +72,21 @@ function text(v: unknown): string | undefined {
 
 // ── PDF 记录 ────────────────────────────────────────────────
 
-export function normalizePdfEntry(raw: any): PdfEntry | null {
+export function normalizePdfEntry(raw: unknown): PdfEntry | null {
   if (!raw || typeof raw !== "object") return null;
-  const fingerprint = text(raw.fingerprint);
+  const src = raw as Record<string, unknown>;
+  const fingerprint = text(src.fingerprint);
   if (!fingerprint) return null;
-  const out: PdfEntry = { ...raw, fingerprint };
-  const page = num(raw.page);
+  const out: PdfEntry = { ...src, fingerprint };
+  const page = num(src.page);
   // page 可能是 null（pdf.js 新建条目时就长这样），保持原样即可
   out.page = page !== null && page >= 1 ? Math.floor(page) : null;
   for (const k of ["scrollLeft", "scrollTop", "rotation", "sidebarView"] as const) {
-    const v = num(raw[k]);
+    const v = num(src[k]);
     if (v !== null) out[k] = v;
   }
-  const zoom = num(raw.zoom) ?? text(raw.zoom);
-  if (zoom !== undefined && zoom !== null) out.zoom = zoom as number | string;
+  const zoom = num(src.zoom) ?? text(src.zoom);
+  if (zoom !== undefined && zoom !== null) out.zoom = zoom;
   return out;
 }
 
@@ -106,17 +107,23 @@ export function samePdfValues(a: PdfEntry | null, b: PdfEntry | null): boolean {
   return true;
 }
 
+/** JSON.parse，但只在结果确实是对象时才认 */
+function parseJsonObject(s: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(s);
+    return v && typeof v === "object" ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parsePdfHistory(raw: string | null | undefined): { files: PdfEntry[] } {
   if (typeof raw !== "string" || !raw) return { files: [] };
-  let obj: any;
-  try {
-    obj = JSON.parse(raw);
-  } catch {
-    return { files: [] };
-  }
-  if (!obj || !Array.isArray(obj.files)) return { files: [] };
+  const parsed = parseJsonObject(raw);
+  const listed = parsed ? parsed.files : undefined;
+  const rawFiles: unknown[] = Array.isArray(listed) ? listed : [];
   const files: PdfEntry[] = [];
-  for (const f of obj.files) {
+  for (const f of rawFiles) {
     const e = normalizePdfEntry(f);
     if (e) files.push(e);
   }
@@ -166,7 +173,7 @@ export function mergePdfHistory(
     }
     const next: PdfEntry = { ...cur };
     for (const k of Object.keys(e)) {
-      const v = (e as any)[k];
+      const v = e[k];
       if (v === undefined) continue; // 别用 undefined 盖掉已有的值
       next[k] = v;
     }
@@ -177,7 +184,7 @@ export function mergePdfHistory(
   for (const e of records) put(e);
   for (const e of live) put(e);
 
-  let files = order.map((fp) => byFp.get(fp)!);
+  let files = order.map((fp) => byFp.get(fp));
   if (files.length > cap) files = files.slice(files.length - cap);
 
   const onDisk = new Map(disk.map((e) => [e.fingerprint, e]));
@@ -232,33 +239,35 @@ export function closeViewport(
 
 // ── 记录整体 ────────────────────────────────────────────────
 
-export function normalizeRecord(raw: any): ViewRecord | null {
+export function normalizeRecord(raw: unknown): ViewRecord | null {
   if (!raw || typeof raw !== "object") return null;
-  const kind = raw.kind;
+  const src = raw as Record<string, unknown>;
+  const kind = src.kind;
   if (kind !== "pdf" && kind !== "canvas" && kind !== "excalidraw") return null;
-  const at = num(raw.at) ?? 0;
+  const at = num(src.at) ?? 0;
   if (kind === "pdf") {
-    const pdf = normalizePdfEntry(raw.pdf);
+    const pdf = normalizePdfEntry(src.pdf);
     if (!pdf) return null;
     return { kind, at, pdf };
   }
-  const x = num(raw.x);
-  const y = num(raw.y);
-  const zoom = num(raw.zoom);
+  const x = num(src.x);
+  const y = num(src.y);
+  const zoom = num(src.zoom);
   if (x === null || y === null || zoom === null || zoom <= 0) return null;
   const out: ViewRecord = { kind, at, x, y, zoom };
-  const w = num(raw.w);
-  const h = num(raw.h);
+  const w = num(src.w);
+  const h = num(src.h);
   if (w !== null && w > 0) out.w = w;
   if (h !== null && h > 0) out.h = h;
   return out;
 }
 
-export function normalizeRecords(raw: any): Records {
+export function normalizeRecords(raw: unknown): Records {
   const out: Records = {};
   if (!raw || typeof raw !== "object") return out;
-  for (const path of Object.keys(raw)) {
-    const rec = normalizeRecord(raw[path]);
+  const src = raw as Record<string, unknown>;
+  for (const path of Object.keys(src)) {
+    const rec = normalizeRecord(src[path]);
     if (rec) out[path] = rec;
   }
   return out;
@@ -296,8 +305,9 @@ export function pruneRecords(records: Records, max = MAX_RECORDS): Records {
   return out;
 }
 
-export function viewKey(leaf: any, path: string): string {
-  const id = leaf && typeof leaf.id === "string" && leaf.id ? leaf.id : "";
+export function viewKey(leaf: unknown, path: string): string {
+  const id =
+    leaf && typeof (leaf as { id?: unknown }).id === "string" ? (leaf as { id: string }).id : "";
   return `${id}|${path}`;
 }
 

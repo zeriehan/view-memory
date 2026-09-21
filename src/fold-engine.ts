@@ -15,12 +15,13 @@ import {
   judgeChange,
   normalizeExpanded,
 } from "./folds";
+import { ExplorerItemLike, ExplorerViewLike } from "./internals";
 
 export interface EngineHost {
   /** 所有文件列表视图（一般是 0 或 1 个） */
-  views(): any[];
+  views(): ExplorerViewLike[];
   /** 路径是不是文件夹。item 可能为 null，此时按 vault 查 */
-  isFolder(path: string, item: any): boolean;
+  isFolder(path: string, item: ExplorerItemLike | null): boolean;
   /** 读 Obsidian 自己那份存储里的展开项（只读，用作首次的种子） */
   readObsidianFolds(): string[];
   /** 读本插件存的快照 */
@@ -182,7 +183,7 @@ export class FoldEngine {
    * 让 Obsidian 把自己那份存储也刷新一遍（它写的就是同一个状态）。
    * 这样即使哪天这个插件没启用，宿主自己的恢复也更可能对。
    */
-  private flushHostFolds(view: any): void {
+  private flushHostFolds(view: ExplorerViewLike): void {
     try {
       const tree = view && view.tree;
       if (!tree) return;

@@ -42,6 +42,19 @@ import {
   serializePdfHistory,
   viewKey,
 } from "./state";
+import {
+  AdapterLike,
+  CanvasLike,
+  CanvasViewStateLike,
+  ExcalidrawApiLike,
+  ExcalidrawAppStateLike,
+  ExplorerViewLike,
+  LeafViewLike,
+  LocalStorageAppLike,
+  PdfStoreLike,
+  PdfViewerAppLike,
+  PdfViewHostLike,
+} from "./internals";
 import { MemorySettingTab } from "./settings";
 
 /** 折叠那半边的配置 */
@@ -89,7 +102,7 @@ function defaultSettings(): MemorySettings {
       debug: false,
       migrated: false,
     }),
-  );
+  ) as MemorySettings;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
@@ -118,7 +131,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
     const foldHost: FoldHost = {
       views: () => this.foldViews(),
       isFolder: (p, item) => {
-        const f: any = (item && item.file) || this.app.vault.getAbstractFileByPath(p);
+        const f: unknown = item?.file ?? this.app.vault.getAbstractFileByPath(p);
         return f instanceof TFolder;
       },
       readObsidianFolds: () => this.readObsidianFolds(),
@@ -276,10 +289,10 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   // ══════════ 折叠侧：宿主细节 ══════════════════════════════
 
-  private foldViews(): any[] {
-    const out: any[] = [];
+  private foldViews(): ExplorerViewLike[] {
+    const out: ExplorerViewLike[] = [];
     for (const leaf of this.app.workspace.getLeavesOfType("file-explorer")) {
-      const v: any = leaf.view;
+      const v = leaf.view as unknown as ExplorerViewLike;
       if (v && v.fileItems) out.push(v);
     }
     return out;
@@ -288,7 +301,9 @@ export default class ObsidianMemoryPlugin extends Plugin {
   /** Obsidian 把展开状态存在 localStorage（键 `file-explorer-unfold`，宿主自动加 vault 前缀） */
   private readObsidianFolds(): string[] {
     try {
-      const raw = (this.app as any).loadLocalStorage?.("file-explorer-unfold");
+      const raw = (this.app as unknown as LocalStorageAppLike).loadLocalStorage?.(
+        "file-explorer-unfold",
+      );
       return normalizeExpanded(raw);
     } catch (e) {
       this.log("读 Obsidian 自带折叠存储失败", e);
@@ -401,16 +416,16 @@ export default class ObsidianMemoryPlugin extends Plugin {
    *     ├ .store      = ViewHistory（就是它把阅读位置写进 localStorage）
    *     └ .pdfDocument
    */
-  private pdfApp(leaf: WorkspaceLeaf): any {
-    const v: any = leaf.view;
+  private pdfApp(leaf: WorkspaceLeaf): PdfViewerAppLike | null {
+    const v = leaf.view as unknown as PdfViewHostLike;
     const wrapper = v && v.viewer;
     const core = wrapper && wrapper.child;
     const app = core && core.pdfViewer;
     return app && app.pdfViewer ? app : null;
   }
 
-  private excalidrawLive(api: any): ViewRecord | null {
-    let st: any = null;
+  private excalidrawLive(api: ExcalidrawApiLike): ViewRecord | null {
+    let st: ExcalidrawAppStateLike | null = null;
     try {
       st = api.getAppState?.();
     } catch {
@@ -419,7 +434,10 @@ export default class ObsidianMemoryPlugin extends Plugin {
     if (!st) return null;
     const x = num(st.scrollX);
     const y = num(st.scrollY);
-    const zoomRaw = st.zoom && typeof st.zoom === "object" ? (st.zoom as any).value : st.zoom;
+    const zoomRaw =
+      st.zoom && typeof st.zoom === "object"
+        ? (st.zoom as { value?: unknown }).value
+        : st.zoom;
     const zoom = num(zoomRaw);
     if (x === null || y === null || zoom === null || zoom <= 0) return null;
     const rec: ViewRecord = { kind: "excalidraw", at: Date.now(), x, y, zoom };
@@ -430,8 +448,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
     return rec;
   }
 
-  private canvasLive(c: any): ViewRecord | null {
-    let st: any = null;
+  private canvasLive(c: CanvasLike): ViewRecord | null {
+    let st: CanvasViewStateLike | null = null;
     try {
       st = c.getState?.();
     } catch {
@@ -448,20 +466,20 @@ export default class ObsidianMemoryPlugin extends Plugin {
   private handles(): ViewHandle[] {
     const out: ViewHandle[] = [];
     const push = (leaf: WorkspaceLeaf, kind: ViewKind, ready: boolean, live: ViewRecord | null) => {
-      const p = (leaf.view as any)?.file?.path;
+      const p = (leaf.view as unknown as LeafViewLike)?.file?.path;
       if (typeof p !== "string" || !p) return;
       out.push({ key: viewKey(leaf, p), path: p, kind, ready, live });
     };
 
     for (const leaf of this.app.workspace.getLeavesOfType("pdf")) {
       const app = this.pdfApp(leaf);
-      const entry: any = app && app.store && app.store.file;
+      const entry = app && app.store && app.store.file;
       const ready = !!(app && app.pdfViewer && app.pdfViewer.pagesCount > 0 && entry);
       push(leaf, "pdf", ready, ready ? { kind: "pdf", at: Date.now(), pdf: { ...entry } } : null);
     }
 
     for (const leaf of this.app.workspace.getLeavesOfType("excalidraw")) {
-      const v: any = leaf.view;
+      const v = leaf.view as unknown as LeafViewLike;
       // 侧边栏那个 excalidraw-sidepanel 是另一种视图，不是画布本身
       if (!v || v.getViewType?.() !== "excalidraw") continue;
       const ready = !!(v._loaded && v.excalidrawAPI && v.excalidrawData);
@@ -469,7 +487,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
     }
 
     for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
-      const v: any = leaf.view;
+      const v = leaf.view as unknown as LeafViewLike;
       const c = v && v.canvas;
       const ready = !!(c && typeof c.getState === "function");
       push(leaf, "canvas", ready, ready ? this.canvasLive(c) : null);
@@ -480,7 +498,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   private leafOf(h: ViewHandle): WorkspaceLeaf | null {
     for (const leaf of this.app.workspace.getLeavesOfType(h.kind)) {
-      const p = (leaf.view as any)?.file?.path;
+      const p = (leaf.view as unknown as LeafViewLike)?.file?.path;
       if (typeof p === "string" && viewKey(leaf, p) === h.key) return leaf;
     }
     return null;
@@ -527,7 +545,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
     const hash = pageHashForEntry(want);
     if (hash) {
       try {
-        (leaf.view as any).setEphemeralState?.({ subpath: hash });
+        (leaf.view as unknown as LeafViewLike).setEphemeralState?.({ subpath: hash });
       } catch (e) {
         this.log("跳转页码失败", e);
       }
@@ -535,7 +553,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
   }
 
   private applyExcalidraw(leaf: WorkspaceLeaf, rec: ViewRecord): void {
-    const v: any = leaf.view;
+    const v = leaf.view as unknown as LeafViewLike;
     const api = v && v.excalidrawAPI;
     if (!api) return;
     // 挡住 Excalidraw 插件自己的「打开时缩放以适应」（zoomToFitOnOpen 默认是开的），
@@ -560,7 +578,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
   }
 
   private applyCanvas(leaf: WorkspaceLeaf, rec: ViewRecord): void {
-    const c = (leaf.view as any)?.canvas;
+    const c = (leaf.view as unknown as LeafViewLike)?.canvas;
     if (!c || typeof c.setState !== "function") return;
     try {
       c.setState({ x: rec.x, y: rec.y, zoom: rec.zoom });
@@ -592,16 +610,16 @@ export default class ObsidianMemoryPlugin extends Plugin {
     disk: PdfEntry[];
     fromRecords: PdfEntry[];
     live: PdfEntry[];
-    stores: { fp: string; store: any }[];
+    stores: { fp: string; store: PdfStoreLike }[];
   } {
     const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
     const fromRecords = pdfEntriesFromRecords(this.settings.view.records);
     const live: PdfEntry[] = [];
-    const stores: { fp: string; store: any }[] = [];
+    const stores: { fp: string; store: PdfStoreLike }[] = [];
     for (const leaf of this.app.workspace.getLeavesOfType("pdf")) {
       const app = this.pdfApp(leaf);
       const store = app && app.store;
-      const entry: any = store && store.file;
+      const entry = store && store.file;
       if (!store || !entry) continue;
       const fp = typeof entry.fingerprint === "string" ? entry.fingerprint : "";
       if (!fp) continue;
@@ -724,15 +742,15 @@ export default class ObsidianMemoryPlugin extends Plugin {
   // ══════════ 配置 ══════════════════════════════════════════
 
   async loadSettings(): Promise<void> {
-    const raw = (await this.loadData()) || {};
-    const merged = Object.assign(defaultSettings(), raw);
+    const raw: unknown = (await this.loadData()) ?? {};
+    const merged = Object.assign(defaultSettings(), raw as Partial<MemorySettings>);
 
     // 折叠侧
     const f = merged.fold;
     if (!f || typeof f !== "object") merged.fold = defaultSettings().fold;
     if (!merged.fold.byVault || typeof merged.fold.byVault !== "object") merged.fold.byVault = {};
     for (const k of Object.keys(merged.fold.byVault)) {
-      const v: any = merged.fold.byVault[k];
+      const v = merged.fold.byVault[k];
       merged.fold.byVault[k] = {
         expanded: normalizeExpanded(v && v.expanded),
         at: v && typeof v.at === "number" ? v.at : 0,
@@ -776,34 +794,38 @@ export default class ObsidianMemoryPlugin extends Plugin {
     const done = { fold: false, view: false };
     if (this.settings.migrated) return done;
     try {
-      const base = (this.app.vault.adapter as any)?.basePath;
+      const base = (this.app.vault.adapter as unknown as AdapterLike)?.basePath;
       if (typeof base !== "string" || !base) return done;
 
-      const readJson = (id: string): any => {
+      const readJson = (id: string): Record<string, unknown> | null => {
         const p = path.join(base, this.app.vault.configDir, "plugins", id, "data.json");
         if (!fs.existsSync(p)) return null;
         try {
-          return JSON.parse(fs.readFileSync(p, "utf8"));
+          const v: unknown = JSON.parse(fs.readFileSync(p, "utf8"));
+          return v && typeof v === "object" ? (v as Record<string, unknown>) : null;
         } catch {
           return null;
         }
       };
 
       const old = readJson("fold-memory");
-      if (old && old.byVault && Object.keys(old.byVault).length) {
-        for (const [k, s] of Object.entries(old.byVault as Record<string, any>)) {
+      const oldByVault = old ? old.byVault : undefined;
+      if (oldByVault && typeof oldByVault === "object" && Object.keys(oldByVault).length) {
+        for (const [k, s] of Object.entries(oldByVault as Record<string, unknown>)) {
           if (this.settings.fold.byVault[k]) continue;
+          const snap = (s ?? {}) as { expanded?: unknown; at?: unknown };
           this.settings.fold.byVault[k] = {
-            expanded: normalizeExpanded(s && s.expanded),
-            at: s && typeof s.at === "number" ? s.at : 0,
+            expanded: normalizeExpanded(snap.expanded),
+            at: typeof snap.at === "number" ? snap.at : 0,
           };
           done.fold = true;
         }
       }
 
       const oldView = readJson("view-memory");
-      if (oldView && oldView.records && Object.keys(oldView.records).length) {
-        for (const [k, rec] of Object.entries(oldView.records as Record<string, any>)) {
+      const oldRecords = oldView ? oldView.records : undefined;
+      if (oldRecords && typeof oldRecords === "object" && Object.keys(oldRecords).length) {
+        for (const [k, rec] of Object.entries(oldRecords as Record<string, unknown>)) {
           if (this.settings.view.records[k]) continue;
           const n = normalizeRecords({ [k]: rec });
           if (n[k]) {
