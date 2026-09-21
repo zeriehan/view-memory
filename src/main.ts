@@ -146,6 +146,9 @@ export default class ObsidianMemoryPlugin extends Plugin {
       `view-memory ${this.manifest.version} 启动`,
       `接管=${JSON.stringify(this.settings.view.kinds)}`,
       `恢复=${this.settings.view.restore}`,
+      `就绪等待=${this.settings.view.settleMs}ms`,
+      `恢复窗口=${this.settings.view.restoreWindowMs}ms`,
+      `最多套用=${this.settings.view.maxAttempts}次`,
       `已有记录 ${Object.keys(this.settings.view.records).length} 条`,
     );
 
@@ -187,20 +190,44 @@ export default class ObsidianMemoryPlugin extends Plugin {
       }, 1000),
     );
 
-    // ── 用户刚动过手的信号：两边共用一份监听 ────────────────
-    const noteInput = () => {
-      this.foldEngine.markUserInput();
-      this.viewEngine.markUserInput();
-    };
-    const inputEvents: (keyof DocumentEventMap)[] = [
+    // ── 用户刚动过手的信号 ────────────────────────────────
+    // 折叠侧「宽口径」：点哪儿都算 —— 它只需要知道"人正在操作界面"。
+    const foldInput = () => this.foldEngine.markUserInput();
+    const foldEvents: (keyof DocumentEventMap)[] = [
       "click",
       "keydown",
       "wheel",
       "touchstart",
       "scroll",
     ];
-    for (const ev of inputEvents) {
-      this.registerDomEvent(document, ev, noteInput, true);
+    for (const ev of foldEvents) {
+      this.registerDomEvent(document, ev, foldInput, true);
+    }
+    // 视窗侧必须「窄口径」，两条限制缺一不可：
+    //  ① 只认真正表达"我在滚 / 我在敲"的事件。click 与 scroll **不能收** —— 宿主自己异步
+    //     摆位置（md 渲染完成后把滚动位置摆好、pdf.js 自己去读那张表）同样会触发它们；
+    //     收进来就会把"宿主在落位"误判成"用户已接手"，然后永久交还、再也不恢复。
+    //  ② 事件必须落在这个视图自己的容器里 —— 否则点一下侧边栏也成了"用户接管了这篇笔记"。
+    const viewInput = (ev: Event) => {
+      const t = ev.target as Node | null;
+      if (!t) return;
+      for (const leaf of this.viewLeaves()) {
+        const c = leaf.view?.containerEl;
+        if (c && c.contains(t)) {
+          this.viewEngine.markUserInput();
+          return;
+        }
+      }
+    };
+    const viewEvents: (keyof DocumentEventMap)[] = [
+      "wheel",
+      "touchstart",
+      "touchmove",
+      "pointerdown",
+      "keydown",
+    ];
+    for (const ev of viewEvents) {
+      this.registerDomEvent(document, ev, viewInput, true);
     }
     // 正常退出时记最后一拍（Obsidian 不保证一定调 onunload）
     this.registerDomEvent(window, "beforeunload", () => this.finishAll());
@@ -509,6 +536,15 @@ export default class ObsidianMemoryPlugin extends Plugin {
     return { kind: "md", at: Date.now(), scroll: raw };
   }
 
+  /** 可能被接管的全部叶子（四种类型）。判断输入事件落在哪个视图里时用 */
+  private viewLeaves(): WorkspaceLeaf[] {
+    const out: WorkspaceLeaf[] = [];
+    for (const kind of Object.keys(LEAF_TYPE) as ViewKind[]) {
+      for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE[kind])) out.push(leaf);
+    }
+    return out;
+  }
+
   private handles(): ViewHandle[] {
     const out: ViewHandle[] = [];
     const push = (leaf: WorkspaceLeaf, kind: ViewKind, ready: boolean, live: ViewRecord | null) => {
@@ -560,7 +596,12 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   private applyRecord(h: ViewHandle, rec: ViewRecord): void {
     const leaf = this.leafOf(h);
-    if (!leaf) return;
+    if (!leaf) {
+      // 别静默返回：1.2.1 那次"md 恢复完全没动"就是这里悄悄 return（拿 "md" 去查叶子，
+      // 而宿主那边叫 "markdown"），外面看不出任何异常。
+      this.log(`套用失败：找不到对应的视图（${h.kind}）${h.path}`);
+      return;
+    }
     if (h.kind === "pdf") this.applyPdf(leaf, rec);
     else if (h.kind === "md") this.applyMarkdown(leaf, rec);
     else if (h.kind === "excalidraw") this.applyExcalidraw(leaf, rec);
@@ -888,20 +929,34 @@ export default class ObsidianMemoryPlugin extends Plugin {
     }
 
     // 视窗侧
-    const v = merged.view;
-    if (!v || typeof v !== "object") merged.view = defaultSettings().view;
-    merged.view.records = normalizeRecords(merged.view.records);
-    if (!merged.view.kinds || typeof merged.view.kinds !== "object") {
-      merged.view.kinds = defaultEngineSettings().kinds;
-    } else {
-      const d = defaultEngineSettings().kinds;
-      merged.view.kinds = {
-        pdf: merged.view.kinds.pdf !== false ? true : d.pdf,
-        md: merged.view.kinds.md !== false ? true : d.md,
-        canvas: merged.view.kinds.canvas === true,
-        excalidraw: merged.view.kinds.excalidraw !== false ? true : d.excalidraw,
-      };
-    }
+    //
+    // ★ 这里**不能**只靠上面那句浅合并。`Object.assign(defaultSettings(), raw)` 是用 raw.view
+    //   **整个替换**掉默认 view 对象的 —— 于是「上次保存之后才新增的字段」就没有值。
+    //   而 `x <= undefined` 恒为 false：restoreWindowMs 曾因此变成 undefined，
+    //   「恢复窗口」判定永远不成立 → 恢复一次都没跑过（日志里连一条「套用」都没有）。
+    //   所以这里逐字段重建，数值项一律兜底。
+    const dv = defaultEngineSettings();
+    const rv = (merged.view ?? {}) as unknown as Record<string, unknown>;
+    const rk = (rv.kinds ?? {}) as Record<string, unknown>;
+    const numOr = (x: unknown, fallback: number): number => {
+      const n = num(x);
+      return n !== null && n >= 0 ? n : fallback;
+    };
+    merged.view = {
+      enabled: rv.enabled !== false,
+      restore: rv.restore !== false,
+      kinds: {
+        pdf: rk.pdf !== false,
+        md: rk.md !== false,
+        canvas: rk.canvas === true,
+        excalidraw: rk.excalidraw !== false,
+      },
+      settleMs: numOr(rv.settleMs, dv.settleMs),
+      maxAttempts: Math.max(1, Math.round(numOr(rv.maxAttempts, dv.maxAttempts))),
+      captureGraceMs: numOr(rv.captureGraceMs, dv.captureGraceMs),
+      restoreWindowMs: numOr(rv.restoreWindowMs, dv.restoreWindowMs),
+      records: normalizeRecords(rv.records),
+    };
 
     // 原地更新，保持对象引用不变（两个引擎拿的就是这两个引用）
     if (!this.settings) this.settings = merged;
@@ -1007,6 +1062,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
     recent: { path: string; text: string; at: number }[];
     views: ViewReport[];
     pdfTableCount: number;
+    timing: { settleMs: number; maxAttempts: number; restoreWindowMs: number };
   } {
     const recs = this.settings.view.records;
     const recent = Object.keys(recs)
@@ -1019,6 +1075,13 @@ export default class ObsidianMemoryPlugin extends Plugin {
       recent,
       views: this.viewEngine ? this.viewEngine.viewReport() : [],
       pdfTableCount: parsePdfHistory(this.readPdfHistoryRaw()).files.length,
+      // 三个"该有值"的参数：它们曾经因为浅合并丢掉过 restoreWindowMs，
+      // 而 undefined 参与比较恒为 false —— 于是恢复一次都没跑。列出来一眼可见。
+      timing: {
+        settleMs: this.settings.view.settleMs,
+        maxAttempts: this.settings.view.maxAttempts,
+        restoreWindowMs: this.settings.view.restoreWindowMs,
+      },
     };
   }
 }

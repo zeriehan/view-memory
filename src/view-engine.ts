@@ -51,11 +51,6 @@ export interface EngineSettings {
   /** 刚套用过之后的静默期：这段时间不回读，也不重复套用 */
   captureGraceMs: number;
   /**
-   * 用户刚操作过的时间窗。窗口内一律不去改视图 ——
-   * 打开 PDF 的瞬间你可能已经在滚了，那会儿把你拽回旧页码是最讨嫌的行为。
-   */
-  userActiveMs: number;
-  /**
    * 一个视图的"恢复阶段"有多长（从它第一次就绪算起）。
    *
    * 过了这段就只记录、不再套用 —— 否则"把视图摆回记录位置"这件事会变成
@@ -73,7 +68,6 @@ export function defaultEngineSettings(): EngineSettings {
     settleMs: 900,
     maxAttempts: 3,
     captureGraceMs: 2500,
-    userActiveMs: 800,
     restoreWindowMs: 6000,
   };
 }
@@ -81,21 +75,16 @@ export function defaultEngineSettings(): EngineSettings {
 interface ViewRuntime {
   firstReadyAt: number;
   /**
-   * 视图**第一次就绪时**的实况。配合下面的 `moved` 回答"实况后来自己动过没有" ——
-   * 这是"用户在动"最可靠的证据（比"用户 N 毫秒内有没有操作"准得多：
-   * 那个窗口既会漏（tick 间隔比窗口大），又会误伤（点一下设置页也算操作））。
+   * 用户在这个视图**就绪之后**真的操作过它吗（滚轮 / 触摸 / 按键 / 按下）。
+   *
+   * ★ 这是判断"用户在动"唯一可靠的证据。曾经我用"实况自己变了"来代替它，
+   *   结果被宿主自己骗了：md 视图渲染完成后会自己把滚动位置摆好、pdf.js 会自己去读
+   *   那张表 —— 这些"动"都不是用户，却让插件以为"他已经接手了"，于是永久交还、
+   *   再也不恢复（用户看到的就是"完全没动"）。
    */
-  firstLive: ViewRecord | null;
-  /**
-   * 就绪以来实况**自己动过**（粘性，一旦发生就永远为真）。
-   * 必须是粘性而不是"此刻是否与初值不同"：用户可能翻了页又翻回来，
-   * 那一刻实况正好等于初值，但"他动过"这件事已经发生过，之后实况就该被信任。
-   */
-  moved: boolean;
+  userTookOver: boolean;
   attempts: number;
   appliedAt: number;
-  /** 套用那一刻的实况。下一拍拿它比：实况自己变了 = 不是我们干的 = 用户在动 */
-  liveAtApply: ViewRecord | null;
   /** 已交还给用户：此后只记录，绝不套用（本视图生命周期内不再复位） */
   handsOff: boolean;
 }
@@ -118,13 +107,17 @@ export class ViewMemoryEngine {
     this.settings = settings;
   }
 
-  /** 用户点了/敲了/滚了 —— 记一下，短时间内别去动他的视图 */
+  /**
+   * 用户真的在这个视图里滚了 / 敲了 / 按下了 —— 宿主必须只在**真实输入事件**上调用它，
+   * 而且必须是"发生在这个视图内部"的事件。别把宿主的异步滚动也算进来。
+   */
   markUserInput(): void {
-    this.lastInputAt = Date.now();
+    this.lastInputAt = this.now();
   }
 
-  private userActive(now: number): boolean {
-    return this.lastInputAt > 0 && now - this.lastInputAt < this.settings.userActiveMs;
+  /** 最近一次真实输入的时间戳（0 = 还没有过）。按视图比较，见 tick 里的 userTookOver */
+  userInputAt(): number {
+    return this.lastInputAt;
   }
 
   private managed(kind: ViewKind): boolean {
@@ -157,6 +150,7 @@ export class ViewMemoryEngine {
     if (sameRecord(old, live)) return false;
     this.host.putRecord(h.path, { ...live, at: this.now() });
     this.dirty = true;
+    this.host.log(`记录位置：${h.path} ${old ? describeRecord(old) : "无"} → ${describeRecord(live)}`);
     return true;
   }
 
@@ -166,12 +160,16 @@ export class ViewMemoryEngine {
    * 顺序很重要：先判"要不要恢复"，再判"要不要记录"。
    * 反过来的话，启动瞬间视图还是默认视窗，就会把默认值当成用户的新位置记下来。
    *
-   * ★ 两条铁律：
-   *  ① **一个视图只允许被"摆"一次**。套用成功、或实况自己动过，之后立刻 hands-off，
-   *     之后实况就是唯一真相。否则"把视图摆回记录位置"会变成长期纠正 —— 用户翻到
-   *     下一页，过一会儿又被拽回上一页，来回闪（PDF 就是这样）。
-   *  ② **绝不用"还没恢复的默认值"覆盖记录**。记录存在、与实况不同、又还没成功套用过、
-   *     而且实况从头到尾没动过 —— 那不是用户的新位置，是"这个视图还没恢复"。
+   * ★ 三条铁律：
+   *  ① **判断"用户在动"只能靠真实输入事件**（滚轮 / 触摸 / 按键 / 按下，且发生在该视图内）。
+   *     绝不能拿"实况变了"来代替 —— 宿主自己也会异步落位（md 渲染完成后自己摆滚动位置、
+   *     pdf.js 自己去读那张表）。把它们当成"用户已经接手"，就会永久交还、再也不恢复 ——
+   *     v1.2.3 就是这样让 md 的恢复一次都没跑起来（日志里一条"套用"都没有）。
+   *  ② **一个视图只会被"摆"有限次**。套用成功、或用户接手、或试满 maxAttempts，
+   *     之后立刻 hands-off，实况就是唯一真相。否则"把视图摆回记录位置"会变成长期纠正 ——
+   *     用户翻到下一页，过一会儿又被拽回上一页，来回闪（PDF 就是这样）。
+   *  ③ **绝不用"还没恢复的默认值"覆盖记录**。记录存在、与实况不同、又还没套用过、
+   *     而且用户没碰过它 —— 那不是用户的新位置，是"这个视图还没恢复"。
    *     把它记下来等于亲手把要恢复的位置抹掉（v1.2.0~1.2.2 就是这么坏的）。
    */
   tick(): TickStats {
@@ -189,58 +187,57 @@ export class ViewMemoryEngine {
       if (!rt) {
         rt = {
           firstReadyAt: 0,
-          firstLive: null,
-          moved: false,
+          userTookOver: false,
           attempts: 0,
           appliedAt: 0,
-          liveAtApply: null,
           handsOff: false,
         };
         this.states.set(h.key, rt);
       }
       if (!this.managed(h.kind)) continue;
       if (!h.ready || !h.live) continue;
-      if (!rt.firstReadyAt) rt.firstReadyAt = now;
-      if (!rt.firstLive) rt.firstLive = h.live;
-      // 就绪以来实况自己动过 —— 那就是别人在动它（用户翻页，或宿主异步落位）。
-      // 粘性：一旦发生过，之后实况就值得信任（哪怕它又变回初值，比如用户翻回上一页）
-      if (!rt.moved && !sameRecord(rt.firstLive, h.live)) {
-        rt.moved = true;
-        this.host.log("视图就绪后实况自己动了：", h.path);
-      }
-      const settled = now - rt.firstReadyAt >= this.settings.settleMs;
-      const inRestoreWindow = now - rt.firstReadyAt <= this.settings.restoreWindowMs;
 
-      // 套用之后实况又变了：不是我们干的 → 交还
-      if (!rt.handsOff && rt.appliedAt && rt.liveAtApply && !sameRecord(rt.liveAtApply, h.live)) {
-        rt.handsOff = true;
-        this.host.log("视图已被接手，不再套用：", h.path);
+      if (!rt.firstReadyAt) {
+        rt.firstReadyAt = now;
+        const first = records[h.path];
+        this.host.log(
+          `视图就绪：${h.path}（${h.kind}）实况 ${describeRecord(h.live)}，记录 ${
+            first && first.kind === h.kind ? describeRecord(first) : "无"
+          }`,
+        );
       }
-      // 还没套用过，实况就自己动了 → 用户已经在翻，交还（别过一会儿再把他拽回来）
-      if (!rt.handsOff && rt.attempts === 0 && rt.moved) {
+      // 真实输入发生在这个视图就绪之后 → 他已经接手了（此后只记录，不再摆）
+      if (!rt.userTookOver && this.lastInputAt > rt.firstReadyAt) {
+        rt.userTookOver = true;
+        this.host.log(`用户已在该视图操作，交还：${h.path}`);
+      }
+
+      const settled = now - rt.firstReadyAt >= this.settings.settleMs;
+      const inWindow = now - rt.firstReadyAt <= this.settings.restoreWindowMs;
+
+      const rec = records[h.path];
+      const usable = !!rec && rec.kind === h.kind;
+      const satisfied = usable && this.isSatisfied(h, rec);
+
+      // 已经到位 / 用户已经接手 → 永久交还（之后只记录）。
+      // 这一步只是记账，所以放在静默期判断**之前** —— 否则"已经到位"这件事要等
+      // 2.5 秒静默期过了才被认下来。
+      if (!rt.handsOff && (satisfied || rt.userTookOver)) {
         rt.handsOff = true;
-        this.host.log("用户在动，交还视图：", h.path);
+        if (satisfied && !rt.userTookOver) this.host.log(`实况已符合记录，不再干预：${h.path}`);
       }
 
       // 刚套用过之后的静默期：既不回读（别把宿主的异步覆盖记成用户的新位置），
       // 也不重复套用（别跟马上要尘埃落定的宿主抢）
       if (rt.appliedAt && now - rt.appliedAt < this.settings.captureGraceMs) continue;
 
-      const rec = records[h.path];
-      const differs = !!rec && rec.kind === h.kind && !this.isSatisfied(h, rec);
-      const wantsRestore = differs && this.settings.restore && !rt.handsOff && inRestoreWindow;
+      const wantsRestore = usable && !satisfied && this.settings.restore && !rt.handsOff && inWindow;
 
       if (wantsRestore) {
         if (!settled) continue; // 还没到动手的时候，先什么都别记
-        if (this.userActive(now)) {
-          // 你正在翻，这一拍什么都不做 —— **也不记**：
-          // 此刻的实况可能是"还没恢复的默认值"，记下来就把记录毁了
-          continue;
-        }
         if (rt.attempts < this.settings.maxAttempts) {
           rt.attempts++;
           rt.appliedAt = now;
-          rt.liveAtApply = h.live;
           let done = false;
           try {
             this.host.applyRecord(h, rec);
@@ -252,22 +249,22 @@ export class ViewMemoryEngine {
           continue; // 同一拍里别把刚改的自己读回来
         }
         rt.handsOff = true; // 试够了，认了
+        this.host.log(`试了 ${rt.attempts} 次仍未到位，不再干预：${h.path}`);
       } else if (!settled) {
         continue;
       }
 
-      // 能不能用实况覆盖记录？——「还没恢复」和「用户挪了地方」必须分开。
+      // 实况能不能覆盖记录？——「还没恢复 / 恢复失败」和「用户挪了地方」必须分开。
       //
-      // 这里是**第二道**防线（第一道是上面 userActive 分支里的 `continue`：该恢复却碰上
-      // 用户正在操作时，那一拍干脆什么都不做）。留着它的意义是：只要"记录存在、与实况不同、
-      // 还没成功套用过、实况也没自己动过"这个组合出现，就绝不覆盖 —— 哪怕以后有人改动了
-      // 上面的流程、让控制流又落到这里。此刻的实况很可能只是"还没恢复的默认值"，
-      // 记下来就等于亲手把要恢复的位置抹掉（v1.2.0~1.2.2 正是这样把记录抹成 0 的）。
+      // 唯一要保护的情况：记录还在、与实况不同、我们**试过却没能摆回去**（attempts > 0）、
+      // 而用户根本没在这个视图里操作过。此刻的实况只是"还没恢复 / 恢复失败"，不是你的位置，
+      // 记下来就把要恢复的地点抹掉了（v1.2.0~1.2.2 正是这样把记录抹成 0 的）。
       //
-      // 反过来，若我们本来就不打算恢复（总开关关了 / 已交还 / 恢复窗口过了），
-      // 记录的唯一职责就是如实跟随实况，这时当然要写。
-      const mightStillRestore = this.settings.restore && !rt.handsOff && inRestoreWindow;
-      const canOverwrite = !rec || !differs || rt.attempts > 0 || rt.moved || !mightStillRestore;
+      // 反过来，下面几种都该照实写：没有同类记录、实况已经符合记录、总开关关着（只记不恢复）、
+      // 用户真的操作过（实况就是他的位置），以及我们从没试过（attempts === 0 —— 比如
+      // handsOff 是因为"一就绪就已经到位"，那之后用户滚到哪儿就该跟到哪儿）。
+      const canOverwrite =
+        !usable || satisfied || !this.settings.restore || rt.userTookOver || rt.attempts === 0;
       if (canOverwrite && this.captureView(h, h.live)) captured++;
     }
 
@@ -326,14 +323,13 @@ export class ViewMemoryEngine {
       if (this.isSatisfied(h, rec)) continue;
       const rt = this.states.get(h.key);
       if (rt) {
-        // 手动恢复是明确意图：重新武装，并把"实况基线"重置到此刻，
-        // 免得下一拍把"我们刚摆的"误判成"用户自己动的"
+        // 手动恢复是明确意图：重新武装 —— 连"用户已接手"也一并撤掉，
+        // 并把"就绪时刻"重置到此刻，否则早已过了恢复窗口就什么都不做
         rt.handsOff = false;
+        rt.userTookOver = false;
         rt.attempts = 0;
         rt.appliedAt = this.now();
-        rt.firstLive = h.live;
-        rt.moved = false;
-        rt.liveAtApply = h.live;
+        rt.firstReadyAt = this.now();
       }
       try {
         this.host.applyRecord(h, rec);
@@ -365,6 +361,7 @@ export class ViewMemoryEngine {
         record: rec ? describeRecord(rec) : "",
         live: h.live ? describeRecord(h.live) : "",
         handsOff: !!rt?.handsOff,
+        userTookOver: !!rt?.userTookOver,
         attempts: rt?.attempts ?? 0,
       };
     });
@@ -382,6 +379,8 @@ export interface ViewReport {
   live: string;
   /** 是否已交还给用户（此后只记录不套用） */
   handsOff: boolean;
+  /** 这次打开后用户是否真的操作过它（真实输入事件，不是"实况变了"） */
+  userTookOver: boolean;
   /** 这个视图一共套用过几次 */
   attempts: number;
 }

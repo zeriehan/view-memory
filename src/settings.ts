@@ -272,10 +272,15 @@ export class MemorySettingTab extends PluginSettingTab {
       line("已记录", `${info.recordCount} 个文件的位置`);
       line("pdf.js 自己的表", `${info.pdfTableCount} 条`);
       line("上一次检查", `恢复了 ${info.stats.restored} 个、记录了 ${info.stats.captured} 个`);
+      line(
+        "参数",
+        `就绪后等 ${info.timing.settleMs}ms · 恢复窗口 ${info.timing.restoreWindowMs}ms · 最多套用 ${info.timing.maxAttempts} 次`,
+      );
       for (const v of info.views) {
         const bits = [`记录 ${v.record || "—"}`, `实况 ${v.live || "—"}`];
         if (v.attempts) bits.push(`已套用 ${v.attempts} 次`);
-        if (v.handsOff) bits.push("已交还给用户");
+        if (v.userTookOver) bits.push("用户已操作过");
+        else if (v.handsOff) bits.push("已交还给用户");
         if (!v.ready) bits.push("还没加载完");
         if (!v.managed) bits.push("未接管");
         box.createDiv({
