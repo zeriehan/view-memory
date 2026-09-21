@@ -10,6 +10,7 @@ import {
   ViewRecord,
   closeScroll,
   closeViewport,
+  describeRecord,
   isPdfEntryUsable,
   sameRecord,
 } from "./state";
@@ -298,13 +299,43 @@ export class ViewMemoryEngine {
     return n;
   }
 
-  /** 设置页展示：当前打开了哪些被管理的视图、各自什么状态 */
-  viewReport(): { path: string; kind: ViewKind; ready: boolean; managed: boolean }[] {
-    return this.host.handles().map((h) => ({
-      path: h.path,
-      kind: h.kind,
-      ready: !!h.ready,
-      managed: this.managed(h.kind),
-    }));
+  /**
+   * 设置页展示：当前打开了哪些被管理的视图、各自什么状态。
+   *
+   * 带上「记录 / 实况 / 是否已交还 / 试了几次」—— 出问题时一眼能分清是
+   * 「压根没套」（两者不同且 attempts=0）、「套了但宿主没照做」（attempts>0 且实况没变）
+   * 还是「套成功了之后用户又动了」（handsOff）。
+   */
+  viewReport(): ViewReport[] {
+    const records = this.host.records();
+    return this.host.handles().map((h) => {
+      const rt = this.states.get(h.key);
+      const rec = records[h.path];
+      return {
+        path: h.path,
+        kind: h.kind,
+        ready: !!h.ready,
+        managed: this.managed(h.kind),
+        record: rec ? describeRecord(rec) : "",
+        live: h.live ? describeRecord(h.live) : "",
+        handsOff: !!rt?.handsOff,
+        attempts: rt?.attempts ?? 0,
+      };
+    });
   }
+}
+
+export interface ViewReport {
+  path: string;
+  kind: ViewKind;
+  ready: boolean;
+  managed: boolean;
+  /** 记录里记的位置（人话） */
+  record: string;
+  /** 当前实况（人话） */
+  live: string;
+  /** 是否已交还给用户（此后只记录不套用） */
+  handsOff: boolean;
+  /** 这个视图一共套用过几次 */
+  attempts: number;
 }

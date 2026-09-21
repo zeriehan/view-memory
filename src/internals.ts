@@ -89,7 +89,11 @@ export interface PdfViewHostLike {
 export interface LeafViewLike {
   file?: PathLike;
   canvas?: CanvasLike;
-  setEphemeralState?(state: { subpath?: string }): void;
+  /**
+   * 深链接 / 临时状态。Markdown 用 `scroll`（这正是它自己在模式切换时用的那条路），
+   * PDF 用 `subpath`（`#page=N`）。
+   */
+  setEphemeralState?(state: { subpath?: string; scroll?: number }): void;
   getViewType?(): string;
   _loaded?: boolean;
   excalidrawAPI?: ExcalidrawApiLike;
@@ -115,7 +119,9 @@ export interface LocalStorageAppLike {
   loadLocalStorage?(key: string): unknown;
 }
 
-/** 文件适配器（桌面端才有 basePath） */
+/** 文件适配器（桌面端才有真实路径） */
 export interface AdapterLike {
   basePath?: string;
+  /** 1.13 起是这个方法；老版本是上面那个属性，两个都认 */
+  getBasePath?(): string;
 }

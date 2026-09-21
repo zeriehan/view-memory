@@ -20,6 +20,7 @@ import {
   EngineSettings as ViewEngineSettings,
   ViewHandle,
   ViewMemoryEngine,
+  ViewReport,
   defaultEngineSettings,
 } from "./view-engine";
 import {
@@ -139,6 +140,14 @@ export default class ObsidianMemoryPlugin extends Plugin {
   async onload(): Promise<void> {
     await this.loadSettings();
     await this.migrateLegacy();
+
+    // 启动时先留一行，包含版本号 —— 排查"到底有没有生效"时，先看这行能确定跑的是哪版
+    this.log(
+      `view-memory ${this.manifest.version} 启动`,
+      `接管=${JSON.stringify(this.settings.view.kinds)}`,
+      `恢复=${this.settings.view.restore}`,
+      `已有记录 ${Object.keys(this.settings.view.records).length} 条`,
+    );
 
     // ── 折叠侧 ────────────────────────────────────────────
     // 注意：settings.fold 是**同一个对象引用**交给引擎的，所以 loadSettings
@@ -558,18 +567,52 @@ export default class ObsidianMemoryPlugin extends Plugin {
     else this.applyCanvas(leaf, rec);
   }
 
-  /** Markdown：把滚动位置摆回去。值就是当前模式的 `applyScroll()` 口径（小数行号） */
+  /**
+   * Markdown：把滚动位置摆回去。
+   *
+   * ★ 必须走宿主自己的路（`MarkdownView.setEphemeralState({ scroll })`）：
+   * 预览模式的 `renderer.applyScroll()` 在**文本还没渲染完 / 段落还没测量**时会
+   * **安静地 `return false`**（什么都不做、也不报错），所以直接调它经常等于没调。
+   * 而 `setEphemeralState({ scroll })` 内部会转成 `applyScrollDelayed` —— 先试一次，
+   * 不成就在 `onRendered` 之后再来一次。Obsidian 自己切换源码/预览模式用的就是这条路。
+   * 另外它会把值记进 `view.scroll`，随后进 leaf state，宿主重启时也能自己恢复。
+   */
   private applyMarkdown(leaf: WorkspaceLeaf, rec: ViewRecord): void {
     const want = num(rec.scroll);
     if (want === null || want < 0) return;
     const v = leaf.view as unknown as LeafViewLike;
     const mode = v && v.currentMode;
-    if (!mode || typeof mode.applyScroll !== "function") return;
-    try {
-      mode.applyScroll(want);
-    } catch (e) {
-      this.log("套用 Markdown 滚动位置失败", e);
+    if (!mode) return;
+
+    let via = "无";
+    if (typeof v.setEphemeralState === "function") {
+      try {
+        v.setEphemeralState({ scroll: want });
+        via = "setEphemeralState";
+      } catch (e) {
+        this.log("套用 Markdown 滚动位置失败（setEphemeralState）", e);
+      }
     }
+    // 兜底：某些版本/模式下 ① 不生效，再直接调一次模式自己的 applyScroll
+    if (typeof mode.applyScroll === "function") {
+      try {
+        mode.applyScroll(want);
+        if (via === "无") via = "applyScroll";
+      } catch (e) {
+        this.log("套用 Markdown 滚动位置失败（applyScroll）", e);
+      }
+    }
+
+    // 读回一次：渲染没完成时上面两下都是"安静地不做"，日志里得能看见
+    let after: number | null = null;
+    try {
+      after = num(mode.getScroll?.());
+    } catch {
+      /* 读不到就算了 */
+    }
+    this.log(
+      `套用 Markdown 位置：想 ${want.toFixed(2)}，立刻读回 ${after === null ? "读不到" : after.toFixed(2)}（走 ${via}）`,
+    );
   }
 
   private applyPdf(leaf: WorkspaceLeaf, rec: ViewRecord): void {
@@ -793,8 +836,37 @@ export default class ObsidianMemoryPlugin extends Plugin {
     }, 3000);
   }
 
+  /**
+   * 日志。开着「调试日志」时**同时写控制台与插件目录下的 view-memory-debug.log** ——
+   * 这样出问题时不必让用户开 DevTools 抄控制台，直接读文件就能拿到真实决策链
+   * （哪一拍跳过了、为什么跳过、套用后读回是多少）。
+   */
   private log(...args: unknown[]): void {
-    if (this.settings && this.settings.debug) console.debug("[view-memory]", ...args);
+    if (!this.settings || !this.settings.debug) return;
+    const msg = args
+      .map((a) =>
+        typeof a === "string" ? a : a instanceof Error ? a.message : JSON.stringify(a),
+      )
+      .join(" ");
+    console.debug("[view-memory]", ...args);
+    try {
+      const adapter = this.app.vault.adapter as unknown as AdapterLike;
+      const base = adapter?.basePath ?? adapter?.getBasePath?.();
+      if (!base) return;
+      const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/view-memory`;
+      fs.appendFileSync(
+        path.join(base, dir, "view-memory-debug.log"),
+        `[${new Date().toISOString()}] ${msg}\n`,
+        "utf8",
+      );
+    } catch {
+      /* 写日志失败绝不能影响主流程 */
+    }
+  }
+
+  /** 调试日志的落盘位置（设置页展示用） */
+  logFilePath(): string {
+    return `${this.manifest.dir || `${this.app.vault.configDir}/plugins/view-memory`}/view-memory-debug.log`;
   }
 
   // ══════════ 配置 ══════════════════════════════════════════
@@ -933,7 +1005,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
     stats: { restored: number; captured: number };
     recordCount: number;
     recent: { path: string; text: string; at: number }[];
-    views: { path: string; kind: ViewKind; ready: boolean; managed: boolean }[];
+    views: ViewReport[];
     pdfTableCount: number;
   } {
     const recs = this.settings.view.records;

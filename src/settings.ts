@@ -213,7 +213,7 @@ export class MemorySettingTab extends PluginSettingTab {
     return [
       {
         name: "调试日志",
-        desc: "在开发者控制台输出对平、恢复与折叠对账的过程（Ctrl+Shift+I 打开）。",
+        desc: `同时写控制台（Ctrl+Shift+I）和插件目录下的 view-memory-debug.log：对平、恢复、交还视图的每一步都有。排查"某个功能没生效"时打开它，日志里能看到是压根没动手、还是动手了但实况没变。日志文件位置：${this.plugin.logFilePath()}`,
         control: { type: "toggle", key: "debug" },
       },
     ];
@@ -273,12 +273,18 @@ export class MemorySettingTab extends PluginSettingTab {
       line("pdf.js 自己的表", `${info.pdfTableCount} 条`);
       line("上一次检查", `恢复了 ${info.stats.restored} 个、记录了 ${info.stats.captured} 个`);
       for (const v of info.views) {
+        const bits = [`记录 ${v.record || "—"}`, `实况 ${v.live || "—"}`];
+        if (v.attempts) bits.push(`已套用 ${v.attempts} 次`);
+        if (v.handsOff) bits.push("已交还给用户");
+        if (!v.ready) bits.push("还没加载完");
+        if (!v.managed) bits.push("未接管");
         box.createDiv({
-          text: `· ${v.path}（${v.kind}${v.ready ? "" : "，还没加载完"}${
-            v.managed ? "" : "，未接管"
-          }）`,
+          text: `· ${v.path}（${v.kind}）${bits.join(" · ")}`,
           cls: "setting-item-description",
         });
+      }
+      if (!info.views.length) {
+        box.createDiv({ text: "· 当前没有打开被接管的视图", cls: "setting-item-description" });
       }
       if (info.recent.length) {
         box.createDiv({ text: "最近记录：", cls: "setting-item-description" });
