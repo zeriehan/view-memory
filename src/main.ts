@@ -107,6 +107,21 @@ function defaultSettings(): MemorySettings {
 
 const sleep = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
 
+/**
+ * 视图类型 → Obsidian 的 **leaf 类型**。
+ *
+ * ★ 两者**不是一回事**：Markdown 的 leaf 类型叫 `"markdown"`，不叫 `"md"`。
+ * 直接拿 `kind` 去 `getLeavesOfType()` 就会查不到任何叶子 —— 而 `leafOf()` 查不到
+ * 叶子只会安静地 `return null`，于是表现成「记录存下来了，但永远套不回去」，
+ * 不报错、不写日志，最难查。所以**凡是要按类型找叶子/遍历叶子，都走这张表**。
+ */
+const LEAF_TYPE: Record<ViewKind, string> = {
+  pdf: "pdf",
+  md: "markdown",
+  canvas: "canvas",
+  excalidraw: "excalidraw",
+};
+
 export default class ObsidianMemoryPlugin extends Plugin {
   settings: MemorySettings;
   private foldEngine: FoldEngine;
@@ -493,14 +508,14 @@ export default class ObsidianMemoryPlugin extends Plugin {
       out.push({ key: viewKey(leaf, p), path: p, kind, ready, live });
     };
 
-    for (const leaf of this.app.workspace.getLeavesOfType("pdf")) {
+    for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE.pdf)) {
       const app = this.pdfApp(leaf);
       const entry = app && app.store && app.store.file;
       const ready = !!(app && app.pdfViewer && app.pdfViewer.pagesCount > 0 && entry);
       push(leaf, "pdf", ready, ready ? { kind: "pdf", at: Date.now(), pdf: { ...entry } } : null);
     }
 
-    for (const leaf of this.app.workspace.getLeavesOfType("excalidraw")) {
+    for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE.excalidraw)) {
       const v = leaf.view as unknown as LeafViewLike;
       // 侧边栏那个 excalidraw-sidepanel 是另一种视图，不是画布本身
       if (!v || v.getViewType?.() !== "excalidraw") continue;
@@ -508,14 +523,14 @@ export default class ObsidianMemoryPlugin extends Plugin {
       push(leaf, "excalidraw", ready, ready ? this.excalidrawLive(v.excalidrawAPI) : null);
     }
 
-    for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
+    for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE.canvas)) {
       const v = leaf.view as unknown as LeafViewLike;
       const c = v && v.canvas;
       const ready = !!(c && typeof c.getState === "function");
       push(leaf, "canvas", ready, ready ? this.canvasLive(c) : null);
     }
 
-    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+    for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE.md)) {
       const v = leaf.view as unknown as LeafViewLike;
       const live = v ? this.mdLive(v) : null;
       push(leaf, "md", !!live, live);
@@ -525,7 +540,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
   }
 
   private leafOf(h: ViewHandle): WorkspaceLeaf | null {
-    for (const leaf of this.app.workspace.getLeavesOfType(h.kind)) {
+    for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE[h.kind])) {
       const p = (leaf.view as unknown as LeafViewLike)?.file?.path;
       if (typeof p === "string" && viewKey(leaf, p) === h.key) return leaf;
     }

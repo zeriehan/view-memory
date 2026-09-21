@@ -1,7 +1,7 @@
 {
   "id": "view-memory",
   "name": "View Memory",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "minAppVersion": "1.13.0",
   "description": "记住文件列表展开到哪、每个笔记滚到哪、每个 PDF 读到第几页，重启后回到原处.",
   "author": "zeriehan",

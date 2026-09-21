@@ -122,11 +122,12 @@ src/settings.ts    设置页
 
 - 折叠侧回归：98 项
 - 视窗侧回归：165 项
-- 合并本身（命令 id 不撞车、配置分离、一个定时器驱动两边、记录迁移、设置页分节、启动引导）：35 项
+- 合并本身（命令 id 不撞车、配置分离、一个定时器驱动两边、记录迁移、设置页分节、启动引导、**Markdown 记录真能套回视图**）：37 项
 
 ## 依赖的非公开成员（升级 Obsidian 后需重跑回归）
 
 - 文件列表：`view.fileItems`、`item.collapsed`、`item.setCollapsed(v, animate)`、`tree.requestSaveFolds()`
+- **leaf 类型 ≠ 视图类型**：Markdown 的 leaf 类型是 `"markdown"`，不叫 `"md"`。`main.ts` 里 `LEAF_TYPE` 这张表就是干这个的，**凡按类型找叶子都要走它** —— 直接拿 `kind` 去 `getLeavesOfType()` 会查不到叶子，而查不到只会安静 `return null`，表现成「记录存了但永远套不回去」。
 - PDF：`view.viewer.child.pdfViewer` → `.store` / `.pdfViewer`；`view.setEphemeralState()`
 - Markdown：`view.currentMode.getScroll()` / `applyScroll(n)`（源码与预览都实现）
 - Excalidraw：`view.excalidrawAPI`、`view.preventAutozoom()`、`view._loaded`、`view.excalidrawData`
