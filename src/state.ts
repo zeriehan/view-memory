@@ -127,6 +127,53 @@ export function samePdfValues(a: PdfEntry | null, b: PdfEntry | null, tol = 2): 
 }
 
 /**
+ * 两个 PDF 条目到底差在哪个字段 —— 只用于日志。
+ *
+ * 之所以需要它：`记录位置：…第 53 页 → 第 53 页` 这种行（页码一样却判定"变了"）
+ * 光看描述根本看不出差在哪，只能靠猜。把它打出来，一眼定位。
+ */
+export function diffPdfValues(a: PdfEntry | null, b: PdfEntry | null, tol = 2): string[] {
+  if (!a || !b) return ["(一侧缺失)"];
+  const out: string[] = [];
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    const av = a[k] === undefined ? null : a[k];
+    const bv = b[k] === undefined ? null : b[k];
+    if (typeof av === "number" && typeof bv === "number" && PDF_FLOAT_FIELDS.has(k)) {
+      if (Math.abs(av - bv) > tol) out.push(`${k}: ${av}→${bv}`);
+      continue;
+    }
+    if (!Object.is(av, bv)) out.push(`${k}: ${JSON.stringify(av)}→${JSON.stringify(bv)}`);
+  }
+  return out;
+}
+
+/**
+ * 把 `next` 的内容**就地**同步进 `target`（target 这个数组对象与里面条目的身份都不变）。
+ *
+ * 为什么要就地：pdf.js 每个视图手里都握着 `store.database.files === target` 这层引用。
+ * 如果每秒换一个新数组，就得每秒把每个 store 重新绑定一次 —— 那等于**高频改写别人的内部状态**。
+ * 就地同步之后，绑定只在视图新出现时做一次。
+ */
+export function syncEntriesInPlace(target: PdfEntry[], next: PdfEntry[]): void {
+  const byFp = new Map(target.map((e) => [String(e.fingerprint), e]));
+  const out: PdfEntry[] = [];
+  for (const e of next) {
+    const cur = byFp.get(String(e.fingerprint));
+    if (!cur) {
+      out.push({ ...e });
+      continue;
+    }
+    // 就地改：多余的键删掉，保持与 next 一致
+    for (const k of Object.keys(cur)) if (!(k in e)) delete cur[k];
+    Object.assign(cur, e);
+    out.push(cur);
+  }
+  target.length = 0;
+  for (const e of out) target.push(e);
+}
+
+/**
  * 整张表的"是否值得落盘"指纹：浮点字段取整后再序列化。
  *
  * 用它替代逐字段严格比对来决定 `localStorage` 写不写 —— 静止时（只有末位抖动）

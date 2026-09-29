@@ -11,6 +11,7 @@ import {
   closeScroll,
   closeViewport,
   describeRecord,
+  diffPdfValues,
   isPdfEntryUsable,
   sameRecord,
 } from "./state";
@@ -36,6 +37,15 @@ export interface ViewHandle {
   ready: boolean;
   /** 当前实况；ready 为 false 时是 null */
   live: ViewRecord | null;
+  /**
+   * 这个叶子当前是否是活跃的（可见的那个）。
+   *
+   * 用途只有一个：**同一份文件同时开在多个叶子里时，只让活跃的那个写记录**。
+   * 否则两个视图各写一次，记录就会来回覆盖 —— 日志里表现为
+   * `第 356 页 → 第 1 页` / `第 1 页 → 第 356 页` 交替出现。
+   * 不传（测试里）按"可写"处理。
+   */
+  active?: boolean;
 }
 
 export interface EngineHost {
@@ -179,7 +189,14 @@ export class ViewMemoryEngine {
     if (sameRecord(old, live)) return false;
     this.host.putRecord(h.path, { ...live, at: this.now() });
     this.dirty = true;
-    this.host.log(`记录位置：${h.path} ${old ? describeRecord(old) : "无"} → ${describeRecord(live)}`);
+    // PDF 记一下"到底差在哪个字段" —— 只写"第 53 页 → 第 53 页"的话，光看日志查不出原因
+    const why =
+      h.kind === "pdf" && old && old.kind === "pdf"
+        ? `（差异：${diffPdfValues(old.pdf, live.pdf).join("，") || "无"}）`
+        : "";
+    this.host.log(
+      `记录位置：${h.path} ${old ? describeRecord(old) : "无"} → ${describeRecord(live)}${why}`,
+    );
     return true;
   }
 
@@ -230,7 +247,7 @@ export class ViewMemoryEngine {
         rt.firstReadyAt = now;
         const first = records[h.path];
         this.host.log(
-          `视图就绪：${h.path}（${h.kind}）实况 ${describeRecord(h.live)}，记录 ${
+          `视图就绪：${h.path}（${h.kind}）key=${h.key} 实况 ${describeRecord(h.live)}，记录 ${
             first && first.kind === h.kind ? describeRecord(first) : "无"
           }`,
         );
@@ -268,7 +285,14 @@ export class ViewMemoryEngine {
       // 也不重复套用（别跟马上要尘埃落定的宿主抢）
       if (rt.appliedAt && now - rt.appliedAt < this.settings.captureGraceMs) continue;
 
-      const wantsRestore = usable && !satisfied && this.settings.restore && !rt.handsOff && inWindow;
+      // 同一份文件同时开在多个叶子里：两个视图各有各的位置，**恢复谁都是把另一边的人拽走**。
+      // 所以这种情况下一个都不恢复；记录只跟活跃的那个（否则两边来回覆盖，
+      // 日志里表现为页码 356 ↔ 1 交替出现）。
+      const shared = handles.filter((x) => x.path === h.path).length > 1;
+      if (shared && h.active === false) continue;
+
+      const wantsRestore =
+        usable && !satisfied && this.settings.restore && !rt.handsOff && inWindow && !shared;
 
       if (wantsRestore) {
         if (!settled) continue; // 还没到动手的时候，先什么都别记
@@ -322,7 +346,10 @@ export class ViewMemoryEngine {
 
     // 视图关掉后把运行态一起扔掉，不然 map 会一直长
     for (const k of Array.from(this.states.keys())) {
-      if (!alive.has(k)) this.states.delete(k);
+      if (alive.has(k)) continue;
+      this.states.delete(k);
+      // 记一笔：视图被关掉/重建。连着出现很多条 = 视图在反复重建（那是吃内存的形态）
+      this.host.log(`视图关闭：key=${k}`);
     }
 
     try {

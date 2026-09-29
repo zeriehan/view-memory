@@ -42,6 +42,7 @@ import {
   pruneRecords,
   renameRecord,
   serializePdfHistory,
+  syncEntriesInPlace,
   viewKey,
 } from "./state";
 import {
@@ -557,10 +558,19 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   private handles(): ViewHandle[] {
     const out: ViewHandle[] = [];
+    // 同一份文件同时开在两个叶子里时，只有活跃的那个该写记录（否则两边来回覆盖）
+    const current = this.app.workspace.getMostRecentLeaf?.() ?? null;
     const push = (leaf: WorkspaceLeaf, kind: ViewKind, ready: boolean, live: ViewRecord | null) => {
       const p = (leaf.view as unknown as LeafViewLike)?.file?.path;
       if (typeof p !== "string" || !p) return;
-      out.push({ key: viewKey(leaf, p), path: p, kind, ready, live });
+      out.push({
+        key: viewKey(leaf, p),
+        path: p,
+        kind,
+        ready,
+        live,
+        active: current ? leaf === current : undefined,
+      });
     };
 
     for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE.pdf)) {
@@ -681,30 +691,11 @@ export default class ObsidianMemoryPlugin extends Plugin {
       return;
     }
 
-    // ① 写回 pdf.js 自己的存储：下次打开由它自己恢复，连页内滚动位置一起
-    const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
-    const merged = mergePdfHistory(disk, [{ ...want }], []);
-    const key = pdfTableSignature(merged.files);
-    if (key !== this.pdfTableKey) {
-      this.writePdfHistoryRaw(serializePdfHistory(merged.files));
-      this.pdfTableKey = key;
-      this.pdfTable = merged.files;
-    }
-    // ② 把打开着的那个 store 也绑到新表上。
-    //    不绑的话它手里那份旧快照下一拍就会把旧页码写回去 —— 这正是原 bug。
-    const store = app && app.store;
-    if (store && this.pdfTable) {
-      const entry = this.pdfTable.find((e) => e.fingerprint === want.fingerprint);
-      if (entry) {
-        try {
-          store.file = entry;
-          store.database = { files: this.pdfTable };
-        } catch (e) {
-          this.log("绑定 PDF 存储失败", e);
-        }
-      }
-    }
-    // ③ 当场也跳过去（不给宿主"下次再说"的机会）
+    // ① 先保证 pdf.js 自己那张表里就是我们的记录。
+    //    交给 reconcilePdf 去做 —— 它会把表**原地**同步好、只在需要时绑一次 store。
+    //    （以前这里直接换新数组 + 手动重绑 store，等于高频改写 pdf.js 的内部对象。）
+    this.reconcilePdf();
+    // ② 当场跳过去（不给宿主"下次再说"的机会）
     const hash = pageHashForEntry(want);
     if (hash) {
       try {
@@ -713,8 +704,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
         this.log("跳转页码失败", e);
       }
     }
-    // ④ 读回一次 —— 宿主可能晚一拍才认这个深链，日志里要能看出到底有没有落地
-    const after = num(app?.pdfViewer?.currentPageNumber) ?? num(store?.file?.page);
+    // ③ 读回一次 —— 宿主可能晚一拍才认这个深链，日志里要能看出到底有没有落地
+    const after = num(app?.pdfViewer?.currentPageNumber) ?? num(app?.store?.file?.page);
     this.log(
       `套用 PDF：${path0} 想第 ${want.page} 页，套用前第 ${before ?? "?"} 页，读回第 ${after ?? "?"} 页（共 ${pages} 页）`,
     );
@@ -814,24 +805,34 @@ export default class ObsidianMemoryPlugin extends Plugin {
     // 用「取整指纹」判断要不要落盘：静止时 scrollTop 末位抖动不算变化 —— 否则
     // 会每秒写一次 localStorage（日志里表现为同一页码被反复"对平"）。
     const key = pdfTableSignature(merged.files);
-    const bound = stores.every(
-      ({ store }) => store.database && store.database.files === this.pdfTable,
-    );
-    if (key === this.pdfTableKey && bound) return;
 
-    const table = merged.files;
+    // ★ 这张表对象必须**保持身份**：每个视图的 store 都握着 `store.database.files === 它`。
+    //   以前每拍都换一个新数组，于是每拍都得把所有 store 重新绑一次 —— 那是在
+    //   高频改写 pdf.js 的内部状态。改成原地同步后，绑定只在视图新出现时做一次。
+    const table = this.pdfTable ?? [];
+    const needRebind = stores.some(
+      ({ store }) => !store.database || store.database.files !== table,
+    );
+    const changed = key !== this.pdfTableKey;
+    if (!changed && !needRebind) return;
+
+    syncEntriesInPlace(table, merged.files);
     this.pdfTable = table;
-    for (const { fp, store } of stores) {
-      const want = table.find((e) => e.fingerprint === fp);
-      if (!want) continue;
-      try {
-        store.file = want;
-        store.database = { files: table };
-      } catch (e) {
-        this.log("绑定 PDF 存储失败", e);
+
+    if (needRebind) {
+      for (const { fp, store } of stores) {
+        if (store.database && store.database.files === table) continue;
+        const want = table.find((e) => e.fingerprint === fp);
+        if (!want) continue;
+        try {
+          store.file = want;
+          store.database = { files: table };
+        } catch (e) {
+          this.log("绑定 PDF 存储失败", e);
+        }
       }
     }
-    if (key !== this.pdfTableKey) {
+    if (changed) {
       this.writePdfHistoryRaw(serializePdfHistory(table));
       this.pdfTableKey = key;
       this.log(`PDF 阅读位置表已对平：${table.length} 条`);
@@ -847,12 +848,18 @@ export default class ObsidianMemoryPlugin extends Plugin {
     const rec = this.settings.view.records[path];
     if (!rec || rec.kind !== "pdf" || !rec.pdf || !isPdfEntryUsable(rec.pdf)) return;
     const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
-    const merged = mergePdfHistory(disk, [{ ...rec.pdf }], []);
+    // 把**所有**记录都带上（不只是这一条），免得顺手把别的 PDF 的条目从表里抹掉
+    const merged = mergePdfHistory(disk, pdfEntriesFromRecords(this.settings.view.records), [
+      { ...rec.pdf },
+    ]);
     const key = pdfTableSignature(merged.files);
     if (key === pdfTableSignature(disk)) return;
     this.writePdfHistoryRaw(serializePdfHistory(merged.files));
     this.pdfTableKey = key;
-    this.pdfTable = merged.files; // 表换了，下一拍会重新绑到各视图上
+    // 原地同步，保持表对象与条目身份不变（视图手里的 store 引用继续有效）
+    const table = this.pdfTable ?? [];
+    syncEntriesInPlace(table, merged.files);
+    this.pdfTable = table;
     this.log(`打开前写回阅读位置：${path} → 第 ${rec.pdf.page} 页`);
   }
 
