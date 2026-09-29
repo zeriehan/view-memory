@@ -128,13 +128,31 @@ const LEAF_TYPE: Record<ViewKind, string> = {
 /** 调试日志文件的上限（超过就把文件清空重来）。防的是"某条路径进入高频循环"时日志无限长 */
 const LOG_MAX_BYTES = 2 * 1024 * 1024;
 
+/**
+ * 待执行的补拍定时器上限。事件高频时靠它兜住 —— 补拍每次要读一遍宿主内部状态、
+ * 合并一遍 PDF 表，堆积起来会占住主线程，PDF 渲染跟着排队。
+ */
+const MAX_DEFER = 10;
+
+/** layout-change 的节流窗口。切视图、视图重建都会连着触发它，一次就排 6 个补拍 */
+const LAYOUT_THROTTLE_MS = 400;
+
 export default class ObsidianMemoryPlugin extends Plugin {
   settings: MemorySettings;
   private foldEngine: FoldEngine;
   private viewEngine: ViewMemoryEngine;
 
   private booted = false;
-  private deferIds: number[] = [];
+  /** 待执行的补拍定时器。用 Set 是为了能真正 clear 掉被丢弃的那些 */
+  private deferIds = new Set<number>();
+  /** 因超过上限被丢弃的补拍数；>0 说明有事件在异常高频地触发 */
+  private deferDropped = 0;
+  /** layout-change 的节流记账 */
+  private lastLayoutAt = 0;
+  private layoutThrottled = 0;
+  /** 补拍频率统计（每秒结算一次） */
+  private tickCount = 0;
+  private tickWindowAt = 0;
   /** 调试日志已写入的字节数；-1 = 还没看过现成文件的大小 */
   private logBytes = -1;
   private reconcileId: number | null = null;
@@ -193,7 +211,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
     this.registerInterval(
       window.setInterval(() => {
         if (this.settings.fold.enabled) this.foldEngine.tick();
-        if (this.settings.view.enabled) this.viewEngine.tick();
+        if (this.settings.view.enabled) this.tickView();
       }, 1000),
     );
 
@@ -245,6 +263,18 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("layout-change", () => {
+        // 节流：切换视图、视图被重建都会连着触发 layout-change，而这里一次就排 6 个
+        // 补拍。不节流的话定时器会堆积（1.2.6 的日志里"表已对平"一秒能刷出三四行）。
+        // 400ms 内的重复直接忽略；被节流的次数记下来，日志里能看出它到底多频繁。
+        const now = Date.now();
+        if (now - this.lastLayoutAt < LAYOUT_THROTTLE_MS) {
+          this.layoutThrottled++;
+          if (this.layoutThrottled === 1 || this.layoutThrottled % 20 === 0) {
+            this.log(`layout-change 过于频繁，已节流 ${this.layoutThrottled} 次`);
+          }
+          return;
+        }
+        this.lastLayoutAt = now;
         if (this.settings.fold.enabled) this.scheduleFoldReconcile([300, 1200, 3000]);
         if (this.settings.view.enabled) this.scheduleViewTick([250, 1000, 2500]);
       }),
@@ -333,7 +363,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   private async unloadCleanup(): Promise<void> {
     for (const id of this.deferIds) window.clearTimeout(id);
-    this.deferIds = [];
+    this.deferIds.clear();
     if (this.reconcileId !== null) {
       window.clearTimeout(this.reconcileId);
       this.reconcileId = null;
@@ -439,13 +469,10 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   private scheduleFoldReconcile(delays: number[]): void {
     for (const d of delays) {
-      this.deferIds.push(
-        window.setTimeout(() => {
-          if (this.foldEngine && this.foldEngine.armed) this.foldEngine.tick();
-        }, d),
-      );
+      this.defer(() => {
+        if (this.foldEngine && this.foldEngine.armed) this.foldEngine.tick();
+      }, d);
     }
-    if (this.deferIds.length > 64) this.deferIds = this.deferIds.slice(-32);
   }
 
   async foldRestore(): Promise<void> {
@@ -765,27 +792,19 @@ export default class ObsidianMemoryPlugin extends Plugin {
     }
   }
 
-  private pdfInputs(): {
-    disk: PdfEntry[];
-    fromRecords: PdfEntry[];
-    live: PdfEntry[];
-    stores: { fp: string; store: PdfStoreLike }[];
-  } {
-    const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
-    const fromRecords = pdfEntriesFromRecords(this.settings.view.records);
-    const live: PdfEntry[] = [];
-    const stores: { fp: string; store: PdfStoreLike }[] = [];
-    for (const leaf of this.app.workspace.getLeavesOfType("pdf")) {
+  /** 当前打开的 PDF 视图 →（指纹 / 它手里的 ViewHistory / 当前条目）。跳过还没加载完的 */
+  private pdfStores(): { fp: string; store: PdfStoreLike; entry: PdfEntry }[] {
+    const out: { fp: string; store: PdfStoreLike; entry: PdfEntry }[] = [];
+    for (const leaf of this.app.workspace.getLeavesOfType(LEAF_TYPE.pdf)) {
       const app = this.pdfApp(leaf);
       const store = app && app.store;
       const entry = store && store.file;
       if (!store || !entry) continue;
       const fp = typeof entry.fingerprint === "string" ? entry.fingerprint : "";
       if (!fp) continue;
-      live.push({ ...entry });
-      stores.push({ fp, store });
+      out.push({ fp, store, entry: { ...entry } });
     }
-    return { disk, fromRecords, live, stores };
+    return out;
   }
 
   /**
@@ -795,48 +814,63 @@ export default class ObsidianMemoryPlugin extends Plugin {
    * 于是后开的那个会把先开的条目整条抹掉（或把它倒回旧值）。
    * 让它们指向同一个对象，谁写都是写同一份，问题从根上没了。
    */
+  /**
+   * 让所有打开的 PDF 视图**共用同一张阅读位置表**。这是"多开 PDF 位置互相覆盖"的正解。
+   *
+   * ★ 这里**绝不写 localStorage**。
+   *
+   *   pdf.js 自己在滚动时就会把整张表写回（它的 `database` 就是我们给它的共享表，
+   *   所以它写的时候天然带上全部条目）。我们再去写就是抢它的活，而 pdf.js 渲染时会
+   *   反复微调 scrollTop（日志里 573 / 635 / 638 / 639 那样来回），每次都被判成"表变了"，
+   *   于是变成**每秒一次同步写盘** —— localStorage 是同步 IO，白占主线程，
+   *   PDF 渲染跟着排队。1.2.6 的日志里"表已对平"一分钟刷几十行就是这个。
+   *
+   *   我们只需要做两件事：
+   *    ① 打开 PDF 之前把记录写回去（preparePdfFor），让 pdf.js 自己恢复；
+   *    ② 让所有视图的 store 都指向同一张表（下面这段）。
+   */
   private reconcilePdf(): void {
-    // 没有 PDF 视图开着 → 没有 store 要绑、也没有实况要收。连 localStorage 都不必解析
-    // （记录本身存在 data.json；真要打开某个 PDF 时，preparePdfFor 会先把它写回去）。
-    if (!this.app.workspace.getLeavesOfType(LEAF_TYPE.pdf).length) return;
-
-    const { disk, fromRecords, live, stores } = this.pdfInputs();
-    const merged = mergePdfHistory(disk, fromRecords, live);
-    // 用「取整指纹」判断要不要落盘：静止时 scrollTop 末位抖动不算变化 —— 否则
-    // 会每秒写一次 localStorage（日志里表现为同一页码被反复"对平"）。
-    const key = pdfTableSignature(merged.files);
+    const stores = this.pdfStores();
+    if (!stores.length) return;
 
     // ★ 这张表对象必须**保持身份**：每个视图的 store 都握着 `store.database.files === 它`。
-    //   以前每拍都换一个新数组，于是每拍都得把所有 store 重新绑一次 —— 那是在
-    //   高频改写 pdf.js 的内部状态。改成原地同步后，绑定只在视图新出现时做一次。
+    //   每拍都换新数组的话，每拍都得把所有 store 重绑一次 —— 那是高频改写别人的内部状态。
     const table = this.pdfTable ?? [];
     const needRebind = stores.some(
       ({ store }) => !store.database || store.database.files !== table,
     );
-    const changed = key !== this.pdfTableKey;
-    if (!changed && !needRebind) return;
+    if (!needRebind) return;
 
-    syncEntriesInPlace(table, merged.files);
+    // 新视图出现了：先把三份来源合进这张表（内存操作），再把它接上
+    const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
+    const fromRecords = pdfEntriesFromRecords(this.settings.view.records);
+    syncEntriesInPlace(
+      table,
+      mergePdfHistory(
+        disk,
+        fromRecords,
+        stores.map(({ entry }) => entry),
+      ).files,
+    );
     this.pdfTable = table;
 
-    if (needRebind) {
-      for (const { fp, store } of stores) {
-        if (store.database && store.database.files === table) continue;
-        const want = table.find((e) => e.fingerprint === fp);
-        if (!want) continue;
-        try {
-          store.file = want;
-          store.database = { files: table };
-        } catch (e) {
-          this.log("绑定 PDF 存储失败", e);
-        }
+    for (const { fp, store, entry } of stores) {
+      if (store.database && store.database.files === table) continue;
+      let want = table.find((e) => e.fingerprint === fp);
+      if (!want) {
+        // 表里没有它 —— 补一条进去，**保证它也被接上**。
+        // 漏掉这个的话，这个视图会继续用自己那份快照，下一拍就把别人的条目覆盖掉。
+        want = { ...entry };
+        table.push(want);
+      }
+      try {
+        store.file = want;
+        store.database = { files: table };
+      } catch (e) {
+        this.log("绑定 PDF 存储失败", e);
       }
     }
-    if (changed) {
-      this.writePdfHistoryRaw(serializePdfHistory(table));
-      this.pdfTableKey = key;
-      this.log(`PDF 阅读位置表已对平：${table.length} 条`);
-    }
+    this.log(`PDF 视图已接到同一张表：${stores.length} 个视图，表内 ${table.length} 条`);
   }
 
   /**
@@ -865,10 +899,47 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   /** 布局变化后补几拍。定时器要记下来，`onunload` 才能清干净（否则插件停用后还有人拍） */
   private scheduleViewTick(delays: number[]): void {
-    for (const d of delays) {
-      this.deferIds.push(window.setTimeout(() => this.viewEngine.tick(), d));
+    for (const d of delays) this.defer(() => this.tickView(), d);
+  }
+
+  /**
+   * 跑一拍视窗引擎。
+   *
+   * 补拍来源是并发的（每秒轮询 + layout-change 排 3 拍 + 切叶子排 2 拍 + 打开文件排 4 拍），
+   * 所以顺手统计频率：一秒内跑太多次就写一行日志 —— 那说明有事件在高频触发，
+   * 下一轮取证直接看这一行，不用再猜。
+   */
+  private tickView(): void {
+    const now = Date.now();
+    if (now - this.tickWindowAt >= 1000) {
+      if (this.tickCount > 3) this.log(`补拍偏密：上一秒跑了 ${this.tickCount} 次视窗检查`);
+      this.tickCount = 0;
+      this.tickWindowAt = now;
     }
-    if (this.deferIds.length > 64) this.deferIds = this.deferIds.slice(-32);
+    this.tickCount++;
+    this.viewEngine.tick();
+  }
+
+  /**
+   * 排一个补拍定时器。三条纪律：
+   *  ① 上限：待执行的补拍不超过 MAX_DEFER，超了**直接丢弃**并计数；
+   *  ② 记账：id 进 Set，执行时自己删掉，被丢弃的一个不排 ——
+   *     以前只是把数组截短、**没有 clearTimeout**，"限制了"是假象；
+   *  ③ 停用/退出时全部清掉。
+   */
+  private defer(fn: () => void, ms: number): void {
+    if (this.deferIds.size >= MAX_DEFER) {
+      this.deferDropped++;
+      if (this.deferDropped === 1 || this.deferDropped % 50 === 0) {
+        this.log(`补拍过密，已丢弃 ${this.deferDropped} 个（待执行 ${this.deferIds.size} 个）`);
+      }
+      return;
+    }
+    const id = window.setTimeout(() => {
+      this.deferIds.delete(id);
+      fn();
+    }, ms);
+    this.deferIds.add(id);
   }
 
   // ══════════ 视窗侧：命令 ══════════════════════════════════
