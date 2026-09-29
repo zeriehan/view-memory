@@ -38,6 +38,7 @@ import {
   pageHashForEntry,
   parsePdfHistory,
   pdfEntriesFromRecords,
+  pdfTableSignature,
   pruneRecords,
   renameRecord,
   serializePdfHistory,
@@ -123,6 +124,9 @@ const LEAF_TYPE: Record<ViewKind, string> = {
   excalidraw: "excalidraw",
 };
 
+/** 调试日志文件的上限（超过就把文件清空重来）。防的是"某条路径进入高频循环"时日志无限长 */
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+
 export default class ObsidianMemoryPlugin extends Plugin {
   settings: MemorySettings;
   private foldEngine: FoldEngine;
@@ -130,6 +134,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   private booted = false;
   private deferIds: number[] = [];
+  /** 调试日志已写入的字节数；-1 = 还没看过现成文件的大小 */
+  private logBytes = -1;
   private reconcileId: number | null = null;
   private foldFlushId: number | null = null;
   private viewFlushId: number | null = null;
@@ -210,13 +216,17 @@ export default class ObsidianMemoryPlugin extends Plugin {
     //  ② 事件必须落在这个视图自己的容器里 —— 否则点一下侧边栏也成了"用户接管了这篇笔记"。
     const viewInput = (ev: Event) => {
       const t = ev.target as Node | null;
-      if (!t) return;
+      if (!t) {
+        this.viewEngine.markUserInput();
+        return;
+      }
       for (const leaf of this.viewLeaves()) {
         const c = leaf.view?.containerEl;
-        if (c && c.contains(t)) {
-          this.viewEngine.markUserInput();
-          return;
-        }
+        if (!c || !c.contains(t)) continue;
+        // 带上这个视图的 key：按视图记账才准，点侧边栏不该算"接管了这篇笔记"
+        const p = (leaf.view as unknown as LeafViewLike)?.file?.path;
+        this.viewEngine.markUserInput(typeof p === "string" && p ? viewKey(leaf, p) : undefined);
+        return;
       }
     };
     const viewEvents: (keyof DocumentEventMap)[] = [
@@ -659,18 +669,29 @@ export default class ObsidianMemoryPlugin extends Plugin {
   private applyPdf(leaf: WorkspaceLeaf, rec: ViewRecord): void {
     const want = rec.pdf;
     if (!want || !want.fingerprint) return;
+    const app = this.pdfApp(leaf);
+    const pages = num(app?.pdfViewer?.pagesCount) ?? 0;
+    const before = num(app?.pdfViewer?.currentPageNumber) ?? num(app?.store?.file?.page);
+    const path0 = (leaf.view as unknown as LeafViewLike)?.file?.path ?? "";
+
+    // 记录里的页码超出这篇文档的页数（文件换过、记录过期…）→ 别去跳。
+    // 硬跳只会落在最后一页，然后每一拍都判定"不符"再跳一次，画面反复跳。
+    if (pages > 0 && typeof want.page === "number" && want.page > pages) {
+      this.log(`记录页码超出文档范围，跳过：${path0} 想第 ${want.page} 页，共 ${pages} 页`);
+      return;
+    }
+
     // ① 写回 pdf.js 自己的存储：下次打开由它自己恢复，连页内滚动位置一起
     const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
     const merged = mergePdfHistory(disk, [{ ...want }], []);
-    const key = serializePdfHistory(merged.files);
+    const key = pdfTableSignature(merged.files);
     if (key !== this.pdfTableKey) {
-      this.writePdfHistoryRaw(key);
+      this.writePdfHistoryRaw(serializePdfHistory(merged.files));
       this.pdfTableKey = key;
       this.pdfTable = merged.files;
     }
     // ② 把打开着的那个 store 也绑到新表上。
     //    不绑的话它手里那份旧快照下一拍就会把旧页码写回去 —— 这正是原 bug。
-    const app = this.pdfApp(leaf);
     const store = app && app.store;
     if (store && this.pdfTable) {
       const entry = this.pdfTable.find((e) => e.fingerprint === want.fingerprint);
@@ -692,6 +713,11 @@ export default class ObsidianMemoryPlugin extends Plugin {
         this.log("跳转页码失败", e);
       }
     }
+    // ④ 读回一次 —— 宿主可能晚一拍才认这个深链，日志里要能看出到底有没有落地
+    const after = num(app?.pdfViewer?.currentPageNumber) ?? num(store?.file?.page);
+    this.log(
+      `套用 PDF：${path0} 想第 ${want.page} 页，套用前第 ${before ?? "?"} 页，读回第 ${after ?? "?"} 页（共 ${pages} 页）`,
+    );
   }
 
   private applyExcalidraw(leaf: WorkspaceLeaf, rec: ViewRecord): void {
@@ -779,9 +805,15 @@ export default class ObsidianMemoryPlugin extends Plugin {
    * 让它们指向同一个对象，谁写都是写同一份，问题从根上没了。
    */
   private reconcilePdf(): void {
+    // 没有 PDF 视图开着 → 没有 store 要绑、也没有实况要收。连 localStorage 都不必解析
+    // （记录本身存在 data.json；真要打开某个 PDF 时，preparePdfFor 会先把它写回去）。
+    if (!this.app.workspace.getLeavesOfType(LEAF_TYPE.pdf).length) return;
+
     const { disk, fromRecords, live, stores } = this.pdfInputs();
     const merged = mergePdfHistory(disk, fromRecords, live);
-    const key = serializePdfHistory(merged.files);
+    // 用「取整指纹」判断要不要落盘：静止时 scrollTop 末位抖动不算变化 —— 否则
+    // 会每秒写一次 localStorage（日志里表现为同一页码被反复"对平"）。
+    const key = pdfTableSignature(merged.files);
     const bound = stores.every(
       ({ store }) => store.database && store.database.files === this.pdfTable,
     );
@@ -800,7 +832,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
       }
     }
     if (key !== this.pdfTableKey) {
-      this.writePdfHistoryRaw(key);
+      this.writePdfHistoryRaw(serializePdfHistory(table));
       this.pdfTableKey = key;
       this.log(`PDF 阅读位置表已对平：${table.length} 条`);
     }
@@ -816,16 +848,20 @@ export default class ObsidianMemoryPlugin extends Plugin {
     if (!rec || rec.kind !== "pdf" || !rec.pdf || !isPdfEntryUsable(rec.pdf)) return;
     const disk = parsePdfHistory(this.readPdfHistoryRaw()).files;
     const merged = mergePdfHistory(disk, [{ ...rec.pdf }], []);
-    const key = serializePdfHistory(merged.files);
-    if (key === serializePdfHistory(disk)) return;
-    this.writePdfHistoryRaw(key);
+    const key = pdfTableSignature(merged.files);
+    if (key === pdfTableSignature(disk)) return;
+    this.writePdfHistoryRaw(serializePdfHistory(merged.files));
     this.pdfTableKey = key;
     this.pdfTable = merged.files; // 表换了，下一拍会重新绑到各视图上
     this.log(`打开前写回阅读位置：${path} → 第 ${rec.pdf.page} 页`);
   }
 
+  /** 布局变化后补几拍。定时器要记下来，`onunload` 才能清干净（否则插件停用后还有人拍） */
   private scheduleViewTick(delays: number[]): void {
-    for (const d of delays) window.setTimeout(() => this.viewEngine.tick(), d);
+    for (const d of delays) {
+      this.deferIds.push(window.setTimeout(() => this.viewEngine.tick(), d));
+    }
+    if (this.deferIds.length > 64) this.deferIds = this.deferIds.slice(-32);
   }
 
   // ══════════ 视窗侧：命令 ══════════════════════════════════
@@ -895,11 +931,21 @@ export default class ObsidianMemoryPlugin extends Plugin {
       const base = adapter?.basePath ?? adapter?.getBasePath?.();
       if (!base) return;
       const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/view-memory`;
-      fs.appendFileSync(
-        path.join(base, dir, "view-memory-debug.log"),
-        `[${new Date().toISOString()}] ${msg}\n`,
-        "utf8",
-      );
+      const file = path.join(base, dir, "view-memory-debug.log");
+      // 日志文件封顶：万一某条路径进入高频循环，日志不能跟着无限长（首次写前看一次现成大小）
+      if (this.logBytes < 0) {
+        try {
+          const size = fs.statSync(file).size;
+          if (size > LOG_MAX_BYTES) fs.writeFileSync(file, "");
+          else this.logBytes = size;
+        } catch {
+          this.logBytes = 0;
+        }
+      }
+      if (this.logBytes > LOG_MAX_BYTES) return;
+      const line = `[${new Date().toISOString()}] ${msg}\n`;
+      fs.appendFileSync(file, line, "utf8");
+      this.logBytes += Buffer.byteLength(line, "utf8");
     } catch {
       /* 写日志失败绝不能影响主流程 */
     }

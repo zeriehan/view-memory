@@ -102,14 +102,47 @@ export function isPdfEntryUsable(e: PdfEntry | null | undefined): boolean {
   return p !== null && p >= 1;
 }
 
-export function samePdfValues(a: PdfEntry | null, b: PdfEntry | null): boolean {
+/**
+ * 浮点字段：比对时给一点容差。
+ *
+ * pdf.js 每次回报的 scrollTop / scrollLeft 会在最后几位抖动 —— 严格相等会让
+ * "页码根本没变"也被判成"变了"，于是**每秒重写一次记录、每秒往 localStorage 写一次表**
+ * （日志里能直接看到：`记录位置：…pdf 第 53 页 → 第 53 页`，一秒一行）。
+ * 2px 以内当作没动，人手是感知不到的，但省掉了大量无谓的写盘。
+ */
+const PDF_FLOAT_FIELDS = new Set<string>(["scrollLeft", "scrollTop", "sidebarWidth"]);
+
+export function samePdfValues(a: PdfEntry | null, b: PdfEntry | null, tol = 2): boolean {
   if (!a || !b) return false;
   for (const k of PDF_FIELDS) {
     const av = a[k] === undefined ? null : a[k];
     const bv = b[k] === undefined ? null : b[k];
+    if (typeof av === "number" && typeof bv === "number" && PDF_FLOAT_FIELDS.has(k)) {
+      if (Math.abs(av - bv) > tol) return false;
+      continue;
+    }
     if (!Object.is(av, bv)) return false;
   }
   return true;
+}
+
+/**
+ * 整张表的"是否值得落盘"指纹：浮点字段取整后再序列化。
+ *
+ * 用它替代逐字段严格比对来决定 `localStorage` 写不写 —— 静止时（只有末位抖动）
+ * 指纹不变 → 一次都不写；真的翻页/缩放时才写。滚动过程中仍会写（那是真变化）。
+ */
+export function pdfTableSignature(files: PdfEntry[]): string {
+  return serializePdfHistory(
+    files.map((e) => {
+      const out: PdfEntry = { ...e };
+      for (const k of PDF_FLOAT_FIELDS) {
+        const v = num(out[k]);
+        if (v !== null) out[k] = Math.round(v);
+      }
+      return out;
+    }),
+  );
 }
 
 /** JSON.parse，但只在结果确实是对象时才认 */

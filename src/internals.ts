@@ -74,10 +74,15 @@ export interface PdfStoreLike {
   database?: { files: PdfEntry[] };
 }
 
-/** PDFViewerApplication 里我们用到的两项 */
+/**
+ * PDFViewerApplication 里我们用到的两项。
+ *
+ * `currentPageNumber` 专门用于**套用后读回验证**：宿主内部 API 的失败常常是静默 no-op，
+ * 只写"我调用了"在失败时等于什么都没写（套用 PDF 时会记日志）。
+ */
 export interface PdfViewerAppLike {
   store?: PdfStoreLike;
-  pdfViewer?: { pagesCount?: number };
+  pdfViewer?: { pagesCount?: number; currentPageNumber?: number };
 }
 
 /** PDF 视图的包装层：view.viewer → .child → PDFViewerApplication */

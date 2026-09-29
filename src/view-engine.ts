@@ -15,6 +15,18 @@ import {
   sameRecord,
 } from "./state";
 
+/**
+ * 我们"看见"一个视图的粒度：tick 每秒一拍，所以一个视图从真的能读到**被我们第一次看见**，
+ * 最多差一拍。用户完全可能在这段时间里已经滚过了 —— 那种输入必须照样算数。
+ *
+ * 这就是「切到 PDF 后滚一下，零点几秒后被拽回原处」的根因：输入发生在
+ * `firstReadyAt` **之前**，于是被判成"不是对这个视图的操作"，接着照常恢复 → 跳回去。
+ */
+const OBSERVE_LAG_MS = 1500;
+
+/** 同一文件连续套用多少次还不成功就停手（防视图被反复重建导致的失控） */
+const MAX_CONSECUTIVE_APPLIES = 6;
+
 export interface ViewHandle {
   /** 同一份文件可能同时开在两个叶子，所以 key 是「叶子 + 路径」 */
   key: string;
@@ -102,20 +114,37 @@ export class ViewMemoryEngine {
   private states = new Map<string, ViewRuntime>();
   private dirty = false;
   private lastInputAt = 0;
+  /** 每个视图（按 handle key）上最后一次真实输入的时间 */
+  private inputAt = new Map<string, number>();
+  /** 每个文件连续套用了几次还没成功 —— 防"视图被反复重建 → 反复套用"的失控 */
+  private applies = new Map<string, number>();
 
   constructor(private host: EngineHost, settings: EngineSettings) {
     this.settings = settings;
   }
 
   /**
-   * 用户真的在这个视图里滚了 / 敲了 / 按下了 —— 宿主必须只在**真实输入事件**上调用它，
-   * 而且必须是"发生在这个视图内部"的事件。别把宿主的异步滚动也算进来。
+   * 用户真的在这个视图里滚了 / 敲了 / 按下了。
+   *
+   * `key` 是 `host.handles()` 里那个 handle key（叶子 + 路径）。**尽量带上它** ——
+   * 按视图记账才准：点一下侧边栏不该算"我接管了这篇笔记"。
+   * 不带也能用（退化成"全局最后一次输入"，只在时间上兜底）。
    */
-  markUserInput(): void {
-    this.lastInputAt = this.now();
+  markUserInput(key?: string): void {
+    const now = this.now();
+    this.lastInputAt = now;
+    if (!key) return;
+    this.inputAt.set(key, now);
+    if (this.inputAt.size > 64) {
+      // 只留最近的，避免长会话里越攒越多
+      const keep = Array.from(this.inputAt.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 32);
+      this.inputAt = new Map(keep);
+    }
   }
 
-  /** 最近一次真实输入的时间戳（0 = 还没有过）。按视图比较，见 tick 里的 userTookOver */
+  /** 最近一次真实输入的时间戳（0 = 还没有过） */
   userInputAt(): number {
     return this.lastInputAt;
   }
@@ -206,8 +235,15 @@ export class ViewMemoryEngine {
           }`,
         );
       }
-      // 真实输入发生在这个视图就绪之后 → 他已经接手了（此后只记录，不再摆）
-      if (!rt.userTookOver && this.lastInputAt > rt.firstReadyAt) {
+      // 真实输入算不算"他已经在动这个视图"？两条都认：
+      //  ① 按这个视图记的输入，且发生在**我们第一次看见它之前一小段时间内** ——
+      //     用户往往在视图刚出现时就滚了，而我们下一拍才看见（见 OBSERVE_LAG_MS）；
+      //  ② 全局最后一次输入发生在我们看见它之后（兜底，覆盖拿不到 key 的情况）。
+      const touchedAt = this.inputAt.get(h.key) ?? 0;
+      if (
+        !rt.userTookOver &&
+        (touchedAt >= rt.firstReadyAt - OBSERVE_LAG_MS || this.lastInputAt > rt.firstReadyAt)
+      ) {
         rt.userTookOver = true;
         this.host.log(`用户已在该视图操作，交还：${h.path}`);
       }
@@ -224,6 +260,7 @@ export class ViewMemoryEngine {
       // 2.5 秒静默期过了才被认下来。
       if (!rt.handsOff && (satisfied || rt.userTookOver)) {
         rt.handsOff = true;
+        if (satisfied) this.applies.delete(h.path); // 成功到位 → 连续套用次数清零
         if (satisfied && !rt.userTookOver) this.host.log(`实况已符合记录，不再干预：${h.path}`);
       }
 
@@ -235,9 +272,23 @@ export class ViewMemoryEngine {
 
       if (wantsRestore) {
         if (!settled) continue; // 还没到动手的时候，先什么都别记
-        if (rt.attempts < this.settings.maxAttempts) {
+        const tried = this.applies.get(h.path) ?? 0;
+        if (tried >= MAX_CONSECUTIVE_APPLIES) {
+          // 连续套这么多次还不到位，多半不是"时机没到"，而是别处不对（页码超出范围、
+          // 视图被反复重建…）。继续套只会让画面反复跳，还可能把宿主拖垮。
+          rt.handsOff = true;
+          this.host.log(`同一文件已连续套用 ${tried} 次仍未到位，停手：${h.path}`);
+        } else if (rt.attempts < this.settings.maxAttempts) {
           rt.attempts++;
           rt.appliedAt = now;
+          this.applies.set(h.path, tried + 1);
+          if (this.applies.size > 200) {
+            // 只留最近的，别在长会话里越攒越多
+            this.applies = new Map(Array.from(this.applies.entries()).slice(-100));
+          }
+          this.host.log(
+            `套用视图状态（第 ${rt.attempts} 次）：${h.path}（${h.kind}）→ ${describeRecord(rec)}`,
+          );
           let done = false;
           try {
             this.host.applyRecord(h, rec);
@@ -247,9 +298,10 @@ export class ViewMemoryEngine {
           }
           if (done) restored++;
           continue; // 同一拍里别把刚改的自己读回来
+        } else {
+          rt.handsOff = true; // 试够了，认了
+          this.host.log(`试了 ${rt.attempts} 次仍未到位，不再干预：${h.path}`);
         }
-        rt.handsOff = true; // 试够了，认了
-        this.host.log(`试了 ${rt.attempts} 次仍未到位，不再干预：${h.path}`);
       } else if (!settled) {
         continue;
       }
