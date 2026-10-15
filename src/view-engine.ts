@@ -125,6 +125,15 @@ interface ViewRuntime {
    *   就会把要恢复的地点抹掉（日志：套用第 53 行 → 2.8 秒后记录变成第 1 行）。
    */
   liveBeforeApply: ViewRecord | null;
+  /**
+   * 这个视图**首次就绪时**读到的那份记录。
+   *
+   * ★ 恢复只认它。同一份文件开在多个叶子里时，记录会被"最近操作过的那个"改写 ——
+   *   如果拿改写后的记录去恢复另一个已经开着的视图，就是把那边的人拽走
+   *   （实测：a 在 6 页、b 在 9 页，记录跟着 a 变成 6 → b 被拽到 6）。
+   *   新开的视图不受影响：它就绪时读到的就是当前记录，照样恢复。
+   */
+  recordAtReady: ViewRecord | null;
   /** 连续几拍没出现在 handles() 里（用于"短暂不可见"的宽限） */
   missing: number;
   /** 已交还给用户：此后只记录，绝不套用（本视图生命周期内不再复位） */
@@ -257,6 +266,7 @@ export class ViewMemoryEngine {
           attempts: 0,
           appliedAt: 0,
           liveBeforeApply: null,
+          recordAtReady: null,
           missing: 0,
           handsOff: false,
         };
@@ -265,11 +275,19 @@ export class ViewMemoryEngine {
       if (!this.managed(h.kind)) continue;
       if (!h.ready || !h.live) continue;
 
+      // 同一份文件可能同时开在多个叶子里（分屏，或者在新标签里又打开一次）。
+      // ★ 记录只能有一个来源，但**恢复要对每个新开的视图都做** —— 见下面的 ownsRecord / wantsRestore。
+      const twins = handles.filter((x) => x.path === h.path);
+      const shared = twins.length > 1;
+
       if (!rt.firstReadyAt) {
         rt.firstReadyAt = now;
         const first = records[h.path];
+        rt.recordAtReady = first ? { ...first } : null; // 恢复只认这份快照
         this.host.log(
-          `视图就绪：${h.path}（${h.kind}）key=${h.key} 实况 ${describeRecord(h.live)}，记录 ${
+          `视图就绪：${h.path}（${h.kind}）key=${h.key}${
+            shared ? `，同文件共 ${twins.length} 个视图` : ""
+          } 实况 ${describeRecord(h.live)}，记录 ${
             first && first.kind === h.kind ? describeRecord(first) : "无"
           }`,
         );
@@ -303,6 +321,22 @@ export class ViewMemoryEngine {
         if (satisfied && !rt.userTookOver) this.host.log(`实况已符合记录，不再干预：${h.path}`);
       }
 
+      // 记录被**别处**改写了（同一份文件开在别的叶子里，那边在写）→ 交还，不再拿它来拽这个视图。
+      // 判据：这份记录和"本就绪时读到的那份"不一样 —— 包括"就绪时还没有记录，后来才被写上"。
+      // 只在"我们从没摆过它"时这样判：摆过之后本来就有别的闸门管着。
+      if (
+        !rt.handsOff &&
+        rt.attempts === 0 &&
+        usable &&
+        !satisfied &&
+        this.settings.restore &&
+        inWindow &&
+        (!rt.recordAtReady || !sameRecord(rt.recordAtReady, rec))
+      ) {
+        rt.handsOff = true;
+        this.host.log(`记录已被别处的视图改写，不再自动恢复这个视图：${h.path}`);
+      }
+
       // 刚套用过之后的静默期：既不回读（别把宿主的异步覆盖记成用户的新位置），
       // 也不重复套用（别跟马上要尘埃落定的宿主抢）
       if (rt.appliedAt && now - rt.appliedAt < this.settings.captureGraceMs) continue;
@@ -323,14 +357,25 @@ export class ViewMemoryEngine {
         continue;
       }
 
-      // 同一份文件同时开在多个叶子里：两个视图各有各的位置，**恢复谁都是把另一边的人拽走**。
-      // 所以这种情况下一个都不恢复；记录只跟活跃的那个（否则两边来回覆盖，
-      // 日志里表现为页码 356 ↔ 1 交替出现）。
-      const shared = handles.filter((x) => x.path === h.path).length > 1;
-      if (shared && h.active === false) continue;
+      // 同一份文件开在多个叶子里时，**记录**只能有一个来源：两边各写一次就是来回覆盖
+      // （日志里表现为页码 356 ↔ 1 交替）。
+      //
+      // 归谁？**归用户最近操作过的那个**。以前只看"谁活跃"，可滚动 md 并不会改变
+      // 活跃叶子，于是你在新开的那个页面里读，滚动根本不会被记录。都没操作过时，
+      // 才退回"归活跃叶子"。
+      const myInput = this.inputAt.get(h.key) ?? 0;
+      const twinInput = twins.reduce(
+        (acc, x) => (x.key === h.key ? acc : Math.max(acc, this.inputAt.get(x.key) ?? 0)),
+        0,
+      );
+      const ownsRecord =
+        !shared || (myInput > 0 ? myInput > twinInput : twinInput === 0 && h.active !== false);
 
+      // ★ 但**恢复对每个视图都要做** —— 新开一个同样的文件，你期望看到上次的位置，
+      //   而不是一片空白（v1.2.6 把恢复也一起禁了，用户看到的就是"被刷新了"）。
+      //   恢复不会互相干扰：每个视图只摆一次（handsOff），摆的是各自的容器。
       const wantsRestore =
-        usable && !satisfied && this.settings.restore && !rt.handsOff && inWindow && !shared;
+        usable && !satisfied && this.settings.restore && !rt.handsOff && inWindow;
 
       if (wantsRestore) {
         if (!settled) continue; // 还没到动手的时候，先什么都别记
@@ -380,7 +425,7 @@ export class ViewMemoryEngine {
       // handsOff 是因为"一就绪就已经到位"，那之后用户滚到哪儿就该跟到哪儿）。
       const canOverwrite =
         !usable || satisfied || !this.settings.restore || rt.userTookOver || rt.attempts === 0;
-      if (canOverwrite && this.captureView(h, h.live)) captured++;
+      if (ownsRecord && canOverwrite && this.captureView(h, h.live)) captured++;
     }
 
     // 视图关掉后把运行态扔掉，不然 map 会一直长。
@@ -396,6 +441,7 @@ export class ViewMemoryEngine {
       sr.missing++;
       if (sr.missing < MISSING_GRACE) continue;
       this.states.delete(k);
+      this.inputAt.delete(k); // 视图都没了，它的"最后操作时刻"也别留着
       // 记一笔：视图被关掉/重建。连着出现很多条 = 视图在反复重建（那是吃内存的形态）
       this.host.log(`视图关闭：key=${k}`);
     }
@@ -461,6 +507,7 @@ export class ViewMemoryEngine {
         rt.attempts = 0;
         rt.appliedAt = this.now();
         rt.liveBeforeApply = h.live;
+        rt.recordAtReady = { ...rec }; // 用户明确要求恢复 → 以当前记录为准
         rt.firstReadyAt = this.now();
       }
       try {
