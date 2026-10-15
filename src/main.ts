@@ -145,6 +145,17 @@ const LAYOUT_THROTTLE_MS = 400;
  */
 const VIEW_FLUSH_MS = 2000;
 
+/**
+ * 补拍批次的去重窗口。
+ *
+ * 切换视图时 layout-change / active-leaf-change / file-open 会连着来，每个都排
+ * 2~4 个补拍 —— 实测快速切换 PDF 能跑到 **11~12 次/秒**（设计是 1 次/秒）。
+ * 而 tick 是**幂等**的：读一遍宿主现状、每个视图判定一次，多跑几次没有任何额外信息，
+ * 只是白白占主线程（PDF 渲染也在主线程上）。所以同一批操作只排一次。
+ * 晚一点跑看到的是更完整的现状，不会漏事。
+ */
+const VIEW_BATCH_MS = 250;
+
 export default class ObsidianMemoryPlugin extends Plugin {
   settings: MemorySettings;
   private foldEngine: FoldEngine;
@@ -161,6 +172,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
   /** 补拍频率统计（每秒结算一次） */
   private tickCount = 0;
   private tickWindowAt = 0;
+  /** 最近一次真正排出的补拍批次（用来给同一批操作去重） */
+  private lastViewBatchAt = 0;
   /** "读不到 currentMode" 记过几条（最多 3 条，免得刷屏） */
   private mdSkipLogged = 0;
   /** 调试日志已写入的字节数；-1 = 还没看过现成文件的大小 */
@@ -918,6 +931,11 @@ export default class ObsidianMemoryPlugin extends Plugin {
 
   /** 布局变化后补几拍。定时器要记下来，`onunload` 才能清干净（否则插件停用后还有人拍） */
   private scheduleViewTick(delays: number[]): void {
+    // 同一批操作只排一次（见 VIEW_BATCH_MS）。这条同时管住三个触发源，
+    // 比给每个事件各加一个节流更省事，也更不容易漏。
+    const now = Date.now();
+    if (now - this.lastViewBatchAt < VIEW_BATCH_MS) return;
+    this.lastViewBatchAt = now;
     for (const d of delays) this.defer(() => this.tickView(), d);
   }
 
