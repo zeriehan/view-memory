@@ -28,6 +28,13 @@ const OBSERVE_LAG_MS = 1500;
 /** 同一文件连续套用多少次还不成功就停手（防视图被反复重建导致的失控） */
 const MAX_CONSECUTIVE_APPLIES = 6;
 
+/**
+ * 一个 handle 连续几拍没出现在 handles() 里才算"真的关掉了"。
+ * 视图在切换/重排时会短暂读不到（file 为空），若一缺席就丢掉运行态，
+ * 下次出现又要重新走一遍"恢复"流程 —— 日志里表现为同一 key 反复"视图就绪"。
+ */
+const MISSING_GRACE = 3;
+
 export interface ViewHandle {
   /** 同一份文件可能同时开在两个叶子，所以 key 是「叶子 + 路径」 */
   key: string;
@@ -58,6 +65,8 @@ export interface EngineHost {
   reconcilePdf(): void;
   /** 有改动时调，宿主自己防抖落盘 */
   flush(): void;
+  /** 立刻落盘（不等防抖）。退出路径用它 —— 排队中的定时器不保证还能执行 */
+  flushNow(): void;
   log(...args: unknown[]): void;
 }
 
@@ -107,6 +116,17 @@ interface ViewRuntime {
   userTookOver: boolean;
   attempts: number;
   appliedAt: number;
+  /**
+   * 套用那一刻的实况。
+   *
+   * ★ 宿主落位是**异步**的（md 的 `setEphemeralState({scroll})` 内部转成
+   *   `applyScrollDelayed`，要等渲染完才套）。所以套用之后看到"实况没变"，
+   *   只能说明**宿主还没动手**，绝不等于用户的位置。拿它去覆写记录，
+   *   就会把要恢复的地点抹掉（日志：套用第 53 行 → 2.8 秒后记录变成第 1 行）。
+   */
+  liveBeforeApply: ViewRecord | null;
+  /** 连续几拍没出现在 handles() 里（用于"短暂不可见"的宽限） */
+  missing: number;
   /** 已交还给用户：此后只记录，绝不套用（本视图生命周期内不再复位） */
   handsOff: boolean;
 }
@@ -236,6 +256,8 @@ export class ViewMemoryEngine {
           userTookOver: false,
           attempts: 0,
           appliedAt: 0,
+          liveBeforeApply: null,
+          missing: 0,
           handsOff: false,
         };
         this.states.set(h.key, rt);
@@ -285,6 +307,22 @@ export class ViewMemoryEngine {
       // 也不重复套用（别跟马上要尘埃落定的宿主抢）
       if (rt.appliedAt && now - rt.appliedAt < this.settings.captureGraceMs) continue;
 
+      // ★★ 套用之后**宿主还没落位** —— 这一拍对此视图什么都不做。
+      //
+      // 判据是"宿主动过没有"，不是固定时长：静默期只有 2.5 秒，而 md 的 applyScrollDelayed
+      // 要等渲染完才套，慢的时候差一点点就漏过去了（实测套用在 xx:49.659、xx:52.502
+      // 实况仍是套用前的旧值，那个旧值就被当成了用户的新位置写进记录）。
+      // 实况只要还和套用那一刻一模一样，就说明它还没被摆过 —— 此刻读到的值没有意义。
+      // 一旦宿主开始落位（实况变了）或恢复窗口过了，就恢复正常判定。
+      if (
+        rt.appliedAt &&
+        rt.liveBeforeApply &&
+        inWindow &&
+        sameRecord(rt.liveBeforeApply, h.live)
+      ) {
+        continue;
+      }
+
       // 同一份文件同时开在多个叶子里：两个视图各有各的位置，**恢复谁都是把另一边的人拽走**。
       // 所以这种情况下一个都不恢复；记录只跟活跃的那个（否则两边来回覆盖，
       // 日志里表现为页码 356 ↔ 1 交替出现）。
@@ -305,6 +343,7 @@ export class ViewMemoryEngine {
         } else if (rt.attempts < this.settings.maxAttempts) {
           rt.attempts++;
           rt.appliedAt = now;
+          rt.liveBeforeApply = h.live; // 记住"摆之前长什么样"，用来判断宿主是否已经落位
           this.applies.set(h.path, tried + 1);
           if (this.applies.size > 200) {
             // 只留最近的，别在长会话里越攒越多
@@ -344,9 +383,18 @@ export class ViewMemoryEngine {
       if (canOverwrite && this.captureView(h, h.live)) captured++;
     }
 
-    // 视图关掉后把运行态一起扔掉，不然 map 会一直长
+    // 视图关掉后把运行态扔掉，不然 map 会一直长。
+    // 但要给"短暂不可见"留几拍宽限：视图切换/重排时可能有一拍读不到它，
+    // 一缺席就丢状态的话，下次出现又要重新走一遍恢复流程（日志里同 key 反复"视图就绪"）。
     for (const k of Array.from(this.states.keys())) {
-      if (alive.has(k)) continue;
+      const sr = this.states.get(k);
+      if (!sr) continue;
+      if (alive.has(k)) {
+        sr.missing = 0;
+        continue;
+      }
+      sr.missing++;
+      if (sr.missing < MISSING_GRACE) continue;
       this.states.delete(k);
       // 记一笔：视图被关掉/重建。连着出现很多条 = 视图在反复重建（那是吃内存的形态）
       this.host.log(`视图关闭：key=${k}`);
@@ -367,14 +415,18 @@ export class ViewMemoryEngine {
     return this.last;
   }
 
-  /** 退出前最后一拍：记下来 + 落盘 */
+  /** 退出前最后一拍：记下来 + **立刻**落盘 */
   finish(): void {
     try {
       this.tick();
     } catch (e) {
       this.host.log("退出前记录失败：", e);
     }
-    this.host.flush();
+    this.dirty = false;
+    // ★ 必须是 flushNow：flush() 只是排一个防抖定时器，而 beforeunload 之后进程随时会走，
+    //   那个定时器基本不会被执行 —— 记录就是这样丢的（日志里更到第 64 行，
+    //   data.json 却停在 3 秒前那一版）。
+    this.host.flushNow();
   }
 
   /** 命令用：无视判定，把当前所有视图的位置立刻记下来 */
@@ -408,6 +460,7 @@ export class ViewMemoryEngine {
         rt.userTookOver = false;
         rt.attempts = 0;
         rt.appliedAt = this.now();
+        rt.liveBeforeApply = h.live;
         rt.firstReadyAt = this.now();
       }
       try {

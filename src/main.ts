@@ -137,6 +137,14 @@ const MAX_DEFER = 10;
 /** layout-change 的节流窗口。切视图、视图重建都会连着触发它，一次就排 6 个补拍 */
 const LAYOUT_THROTTLE_MS = 400;
 
+/**
+ * 记录落盘的防抖窗口。
+ * ★ 必须是"首次有改动就排一次、期间不再重置"，不能每次改动都往后推 ——
+ *   连续滚动时那样会永远不写盘（本项目实测：日志里记录一路更到第 64 行，
+ *   data.json 却停在 3 秒前的那一版）。
+ */
+const VIEW_FLUSH_MS = 2000;
+
 export default class ObsidianMemoryPlugin extends Plugin {
   settings: MemorySettings;
   private foldEngine: FoldEngine;
@@ -153,6 +161,8 @@ export default class ObsidianMemoryPlugin extends Plugin {
   /** 补拍频率统计（每秒结算一次） */
   private tickCount = 0;
   private tickWindowAt = 0;
+  /** "读不到 currentMode" 记过几条（最多 3 条，免得刷屏） */
+  private mdSkipLogged = 0;
   /** 调试日志已写入的字节数；-1 = 还没看过现成文件的大小 */
   private logBytes = -1;
   private reconcileId: number | null = null;
@@ -203,6 +213,7 @@ export default class ObsidianMemoryPlugin extends Plugin {
       applyRecord: (h, rec) => this.applyRecord(h, rec),
       reconcilePdf: () => this.reconcilePdf(),
       flush: () => this.flushView(),
+      flushNow: () => this.flushViewNow(),
       log: (...a) => this.log(...a),
     };
     this.viewEngine = new ViewMemoryEngine(viewHost, this.settings.view);
@@ -563,7 +574,15 @@ export default class ObsidianMemoryPlugin extends Plugin {
    */
   private mdLive(v: LeafViewLike): ViewRecord | null {
     const mode = v.currentMode;
-    if (!mode || typeof mode.getScroll !== "function") return null;
+    if (!mode || typeof mode.getScroll !== "function") {
+      // 偶尔读不到是正常的（视图正在加载），但**每一拍都读不到**就意味着这半边废了。
+      // 记前几条就够，免得刷屏。
+      if (this.mdSkipLogged < 3) {
+        this.mdSkipLogged++;
+        this.log(`Markdown 视图读不到 currentMode，这一拍跳过：${v.file?.path ?? "?"}`);
+      }
+      return null;
+    }
     let raw: number | null = null;
     try {
       raw = num(mode.getScroll());
@@ -981,14 +1000,30 @@ export default class ObsidianMemoryPlugin extends Plugin {
     }, 600);
   }
 
-  /** 落盘防抖：滚动时每拍都可能有变化，但没必要每拍都写盘 */
+  /**
+   * 落盘防抖：滚动时每拍都可能有变化，但没必要每拍都写盘。
+   *
+   * ★ 这里**不能**"每次有改动就把定时器清掉重排" —— 连续滚动时会一直往后推，
+   *   直到你停下 3 秒才写；中途退出（或插件重载）那一版就永久丢了。
+   *   现在改成：已经排好了就不再动它，到点就写。写的是整个 settings，
+   *   所以期间累积的改动都会被带上。
+   */
   private flushView(): void {
     this.settings.view.records = pruneRecords(this.settings.view.records, MAX_RECORDS);
-    if (this.viewFlushId !== null) window.clearTimeout(this.viewFlushId);
+    if (this.viewFlushId !== null) return; // 已经排好了，别往后推
     this.viewFlushId = window.setTimeout(() => {
       this.viewFlushId = null;
       void this.saveSettings();
-    }, 3000);
+    }, VIEW_FLUSH_MS);
+  }
+
+  /** 立刻落盘，清掉待执行的防抖定时器。退出路径用它 */
+  private flushViewNow(): void {
+    if (this.viewFlushId !== null) {
+      window.clearTimeout(this.viewFlushId);
+      this.viewFlushId = null;
+    }
+    void this.saveSettings();
   }
 
   /**
